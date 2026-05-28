@@ -6,9 +6,9 @@ const NAV = [
   { id: 'orders',   label: 'Pedidos',              icon: 'Receipt',    section: 'OPERATIONS'    },
   { id: 'devices',  label: 'Devices',              icon: 'Tablet',     section: 'OPERATIONS', badge: '4' },
   { id: 'staff',    label: 'Staff & Access',       icon: 'Users',      section: 'OPERATIONS'    },
-  { id: 'conversations', label: 'Conversaciones',  icon: 'WhatsApp',   section: 'OPERATIONS'    },
-  { id: 'members',  label: 'Miembros',             icon: 'CreditCard', section: 'LOYALTY'       },
-  { id: 'gift-cards', label: 'Gift Cards',          icon: 'Gift',       section: 'LOYALTY'       },
+  { id: 'customers', label: 'Customers',            icon: 'Users2',     section: 'OPERATIONS'    },
+  { id: 'members',  label: 'Loyalty',               icon: 'CreditCard', section: 'GROWTH'        },
+  { id: 'gift-cards', label: 'Gift Cards',          icon: 'Gift',       section: 'GROWTH'        },
   { id: 'hours',    label: 'Hours & Availability', icon: 'Clock',      section: 'CONFIGURATION', badge: 'PAUSED', badgeKind: 'warn' },
   { id: 'settings', label: 'Settings',             icon: 'Settings',   section: 'CONFIGURATION' },
 ];
@@ -211,9 +211,9 @@ const Topbar = ({ business, status, onMenu, screen, tenantName, locations = [], 
     orders:    { eyebrow: '02 / OPERACIONES',    title: 'Pedidos WhatsApp',          en: 'KDS tickets'        },
     devices:   { eyebrow: '03 / OPERACIONES',    title: 'Dispositivos KDS',          en: 'Kitchen displays'   },
     staff:     { eyebrow: '04 / OPERACIONES',    title: 'Equipo y permisos',         en: 'Staff & Access'     },
-    conversations: { eyebrow: '05 / OPERACIONES', title: 'Conversaciones WhatsApp',  en: 'ConversaFlow threads' },
-    members:   { eyebrow: '06 / LEALTAD',        title: 'Miembros',                  en: 'Loyalty members'    },
-    'gift-cards': { eyebrow: '07 / LEALTAD',     title: 'Gift cards',                en: 'Umi Cash cards'     },
+    customers: { eyebrow: '05 / OPERACIONES',    title: 'Customers',                 en: 'Customer platform'  },
+    members:   { eyebrow: '06 / GROWTH',         title: 'Loyalty',                   en: 'Umi Cash members'   },
+    'gift-cards': { eyebrow: '07 / GROWTH',      title: 'Gift cards',                en: 'Umi Cash cards'     },
     hours:     { eyebrow: '08 / CONFIGURACIÓN',  title: 'Horario y disponibilidad',  en: 'Hours & Availability' },
     settings:  { eyebrow: '09 / CONFIGURACIÓN',  title: 'Ajustes',                   en: 'Settings'           },
     'products-billing': { eyebrow: '10 / CONFIGURACIÓN', title: 'Products & Billing', en: 'Subscription'       },
@@ -260,9 +260,6 @@ const Topbar = ({ business, status, onMenu, screen, tenantName, locations = [], 
           <button className="btn-icon focusable" aria-label="Notifications" style={{position:'relative'}}>
             <I.Bell size={18}/>
             <span style={{position:'absolute', top:6, right:6, width:6, height:6, borderRadius:'50%', background:'var(--danger)'}}></span>
-          </button>
-          <button className="btn btn-secondary focusable">
-            <I.Sparkles size={16}/> Insights
           </button>
         </div>
       </header>

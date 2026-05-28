@@ -50,7 +50,7 @@ function createMailTransport() {
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin',  DEV_ORIGIN)
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS')
-  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-UMI-User-ID')
+  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-UMI-User-ID,X-KDS-Device-Token,apikey')
   if (req.method === 'OPTIONS') return res.sendStatus(204)
   next()
 })
@@ -73,9 +73,19 @@ app.get('/api/health', async (_req, res) => {
 // In-memory only: resets on server restart, which is fine for local dev.
 const _kdsHeartbeats = new Map() // deviceId → { lastSeen, deviceName, stationId, ip }
 
-app.post('/api/kds/heartbeat', (req, res) => {
+app.post('/api/kds/heartbeat', async (req, res) => {
   const { device_id, device_name, station_id, station_name } = req.body || {}
   if (!device_id) return res.status(400).json({ error: 'device_id required' })
+  try {
+    const rows = PLATFORM_TRANSITION_SCHEMA
+      ? await prisma.$queryRaw`SELECT is_active FROM kds.device_sessions WHERE id = ${device_id}::uuid LIMIT 1`
+      : await prisma.$queryRaw`SELECT is_active FROM kds.device_sessions WHERE device_id = ${device_id}::uuid LIMIT 1`
+    if (rows[0] && rows[0].is_active !== true) return res.status(403).json(kdsRevokedPayload())
+    if (!rows[0]) return res.status(404).json({ error: 'device_session_not_found' })
+  } catch (err) {
+    console.error('[kds heartbeat]', err.message)
+    return res.status(503).json({ error: 'service_unavailable' })
+  }
   _kdsHeartbeats.set(device_id, {
     deviceId:    device_id,
     deviceName:  device_name  || 'KDS',
@@ -89,13 +99,17 @@ app.post('/api/kds/heartbeat', (req, res) => {
 
 // Returns all known heartbeats. Dashboard merges this with cloud device list.
 app.get('/api/kds/heartbeats', (_req, res) => {
-  const OFFLINE_THRESHOLD_MS = 15_000 // 3 missed 5-s pings = offline
+  const SLOW_THRESHOLD_MS = 10_000
+  const OFFLINE_THRESHOLD_MS = 20_000 // 4 missed 5-s pings = offline
   const now = Date.now()
-  const result = Array.from(_kdsHeartbeats.values()).map(h => ({
-    ...h,
-    status: (now - h.lastSeen) < OFFLINE_THRESHOLD_MS ? 'live' : 'offline',
-    secondsAgo: Math.floor((now - h.lastSeen) / 1000),
-  }))
+  const result = Array.from(_kdsHeartbeats.values()).map(h => {
+    const ageMs = now - h.lastSeen
+    return {
+      ...h,
+      status: ageMs < SLOW_THRESHOLD_MS ? 'live' : ageMs < OFFLINE_THRESHOLD_MS ? 'slow' : 'offline',
+      secondsAgo: Math.floor(ageMs / 1000),
+    }
+  })
   res.json(result)
 })
 
@@ -578,6 +592,577 @@ function redirectWithQuery(req, res, targetPath) {
   return res.redirect(307, qs ? `${targetPath}?${qs}` : targetPath)
 }
 
+function normalizeCustomerPhone(phone) {
+  const digits = String(phone || '').replace(/\D+/g, '')
+  if (!digits) return null
+  if (digits.length === 10) return `+52${digits}`
+  if (digits.length === 11 && digits.startsWith('1')) return `+52${digits.slice(-10)}`
+  if (digits.length === 12 && digits.startsWith('52')) return `+${digits}`
+  if (digits.length === 13 && digits.startsWith('521')) return `+52${digits.slice(-10)}`
+  if (digits.startsWith('0') && digits.length > 10) return `+52${digits.slice(-10)}`
+  return `+${digits}`
+}
+
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(value || ''))
+}
+
+function productAvailable(capabilities, productKey) {
+  return PRODUCT_ACTIVE_STATUSES.has(capabilities?.products?.[productKey]?.status)
+}
+
+function iso(value) {
+  return value?.toISOString?.() ?? value ?? null
+}
+
+function centsToMoney(cents) {
+  return fmt(cents || 0)
+}
+
+function platformCustomerDto(row, capabilities) {
+  const identityList = Array.isArray(row.identities) ? row.identities : []
+  const cashAvailable = productAvailable(capabilities, 'cash')
+  const conversaflowAvailable = productAvailable(capabilities, 'conversaflow')
+  const kdsAvailable = productAvailable(capabilities, 'kds')
+  const hasCash = Number(row.loyalty_count || 0) > 0
+  const hasWhatsapp = Number(row.conversation_count || 0) > 0 || identityList.some((identity) => identity.identity_type === 'whatsapp')
+  const hasOrders = Number(row.orders_count || 0) > 0
+  const needsReview = Number(row.merge_candidate_count || 0) > 0 || Number(row.data_quality_count || 0) > 0
+  const factsCount = Number(row.memory_count || 0)
+  const lastTouchAt = iso(row.last_touch_at || row.updated_at || row.created_at)
+
+  return {
+    id: row.id,
+    displayName: row.display_name || row.normalized_phone || row.phone || row.email || 'Unknown customer',
+    phone: row.phone || row.normalized_phone || '',
+    normalizedPhone: row.normalized_phone || normalizeCustomerPhone(row.phone),
+    email: row.email || '',
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+    lastTouchAt,
+    status: needsReview ? 'needs_review' : hasOrders || hasCash || hasWhatsapp ? 'active' : 'new',
+    products: {
+      whatsapp: { available: conversaflowAvailable, active: hasWhatsapp, source: hasWhatsapp ? 'conversaflow' : 'none', conversations: Number(row.conversation_count || 0), activeConversations: Number(row.active_conversations || 0) },
+      cash: { available: cashAvailable, active: hasCash, source: hasCash ? 'cash' : 'none' },
+      orders: { available: kdsAvailable || conversaflowAvailable, active: hasOrders, source: hasOrders ? 'commerce' : 'none' },
+      giftCards: { available: cashAvailable, active: Number(row.gift_card_count || 0) > 0, source: Number(row.gift_card_count || 0) > 0 ? 'cash' : 'none' },
+    },
+    value: {
+      orders: Number(row.orders_count || 0),
+      totalSpendCents: Number(row.total_spend_cents || 0),
+      totalSpend: centsToMoney(Number(row.total_spend_cents || 0)),
+      visits: Number(row.total_visits || 0),
+      walletBalanceCents: Number(row.wallet_balance_cents || 0),
+      walletBalance: centsToMoney(Number(row.wallet_balance_cents || 0)),
+    },
+    memory: {
+      factsCount,
+      embeddingHealth: factsCount > 0 ? 'context_ready' : 'no_memory_yet',
+      summary: factsCount > 0 ? `${factsCount} memory item${factsCount === 1 ? '' : 's'}` : 'No extracted facts yet',
+    },
+    dataQuality: {
+      mergeCandidates: Number(row.merge_candidate_count || 0),
+      findings: Number(row.data_quality_count || 0),
+      needsReview,
+    },
+    identities: identityList,
+  }
+}
+
+async function loadPlatformCustomers(capabilities, options = {}) {
+  const page = Math.max(1, parseInt(options.page || '1') || 1)
+  const limit = Math.max(1, Math.min(parseInt(options.limit || '20') || 20, 100))
+  const search = String(options.search || '').trim().slice(0, 80)
+  const filter = String(options.filter || '').trim().slice(0, 24)
+  const contactId = String(options.contactId || '').trim()
+  const contactUuid = isUuid(contactId) ? contactId : capabilities.tenant.id
+  const skip = (page - 1) * limit
+  const tenantId = capabilities.tenant.id
+
+  const rows = await prisma.$queryRaw`
+    SELECT
+      c.id::text,
+      c.display_name,
+      c.phone,
+      c.email,
+      c.created_at,
+      c.updated_at,
+      COALESCE(phone_identity.normalized_value, c.phone) AS normalized_phone,
+      COALESCE(identities.items, '[]'::jsonb) AS identities,
+      COALESCE(cash_summary.loyalty_count, 0)::int AS loyalty_count,
+      COALESCE(cash_summary.total_visits, 0)::int AS total_visits,
+      COALESCE(cash_summary.wallet_balance_cents, 0)::int AS wallet_balance_cents,
+      COALESCE(cash_summary.gift_card_count, 0)::int AS gift_card_count,
+      COALESCE(conversation_summary.conversation_count, 0)::int AS conversation_count,
+      COALESCE(conversation_summary.active_conversations, 0)::int AS active_conversations,
+      COALESCE(order_summary.orders_count, 0)::int AS orders_count,
+      COALESCE(order_summary.total_spend_cents, 0)::int AS total_spend_cents,
+      COALESCE(memory_summary.memory_count, 0)::int AS memory_count,
+      COALESCE(quality_summary.data_quality_count, 0)::int AS data_quality_count,
+      COALESCE(merge_summary.merge_candidate_count, 0)::int AS merge_candidate_count,
+      last_touch.last_touch_at
+    FROM platform.contacts AS c
+    LEFT JOIN LATERAL (
+      SELECT ci.normalized_value
+      FROM platform.contact_identities AS ci
+      WHERE ci.contact_id = c.id
+        AND ci.identity_type IN ('phone', 'whatsapp')
+        AND ci.normalized_value IS NOT NULL
+      ORDER BY CASE WHEN ci.identity_type = 'phone' THEN 0 ELSE 1 END, ci.created_at ASC
+      LIMIT 1
+    ) AS phone_identity ON true
+    LEFT JOIN LATERAL (
+      SELECT jsonb_agg(
+        jsonb_build_object(
+          'id', ci.id::text,
+          'identity_type', ci.identity_type,
+          'identity_value', ci.identity_value,
+          'normalized_value', ci.normalized_value,
+          'provider', ci.provider,
+          'verification_status', ci.verification_status,
+          'confidence', ci.confidence
+        )
+        ORDER BY ci.identity_type, ci.created_at
+      ) AS items
+      FROM platform.contact_identities AS ci
+      WHERE ci.contact_id = c.id
+    ) AS identities ON true
+    LEFT JOIN LATERAL (
+      SELECT
+        count(la.id) AS loyalty_count,
+        COALESCE(sum(lc.total_visits), 0) AS total_visits,
+        COALESCE(sum(lc.balance_cents), 0) AS wallet_balance_cents,
+        count(gc.id) AS gift_card_count,
+        max(GREATEST(lc.updated_at, la.updated_at)) AS last_cash_at
+      FROM cash.loyalty_accounts AS la
+      LEFT JOIN cash.loyalty_cards AS lc ON lc.loyalty_account_id = la.id
+      LEFT JOIN cash.gift_cards AS gc ON gc.recipient_contact_id = c.id
+      WHERE la.contact_id = c.id
+    ) AS cash_summary ON true
+    LEFT JOIN LATERAL (
+      SELECT
+        count(cv.id) AS conversation_count,
+        count(cv.id) FILTER (WHERE cv.status IN ('open', 'pending', 'active')) AS active_conversations,
+        max(cv.updated_at) AS last_conversation_at
+      FROM conversaflow.conversations AS cv
+      WHERE cv.contact_id = c.id
+    ) AS conversation_summary ON true
+    LEFT JOIN LATERAL (
+      SELECT
+        count(o.id) AS orders_count,
+        COALESCE(sum(o.total_cents), 0) AS total_spend_cents,
+        max(COALESCE(o.placed_at, o.created_at)) AS last_order_at
+      FROM commerce.orders AS o
+      WHERE o.contact_id = c.id
+    ) AS order_summary ON true
+    LEFT JOIN LATERAL (
+      SELECT count(mi.id) AS memory_count, max(mi.updated_at) AS last_memory_at
+      FROM conversaflow.memory_items AS mi
+      WHERE mi.contact_id = c.id
+    ) AS memory_summary ON true
+    LEFT JOIN LATERAL (
+      SELECT count(dq.id) AS data_quality_count, max(dq.created_at) AS last_quality_at
+      FROM observability.data_quality_findings AS dq
+      WHERE dq.tenant_id = c.tenant_id
+        AND dq.status = 'open'
+        AND dq.subject_id = c.id::text
+    ) AS quality_summary ON true
+    LEFT JOIN LATERAL (
+      SELECT count(mc.id) AS merge_candidate_count, max(mc.created_at) AS last_merge_at
+      FROM platform.contact_merge_candidates AS mc
+      WHERE mc.tenant_id = c.tenant_id
+        AND mc.confidence IN ('candidate', 'high')
+        AND (mc.left_contact_id = c.id OR mc.right_contact_id = c.id)
+    ) AS merge_summary ON true
+    LEFT JOIN LATERAL (
+      SELECT max(ts) AS last_touch_at
+      FROM (VALUES
+        (c.updated_at),
+        (cash_summary.last_cash_at),
+        (conversation_summary.last_conversation_at),
+        (order_summary.last_order_at),
+        (memory_summary.last_memory_at),
+        (quality_summary.last_quality_at),
+        (merge_summary.last_merge_at)
+      ) AS touch(ts)
+    ) AS last_touch ON true
+    WHERE c.tenant_id = ${tenantId}::uuid
+      AND (${contactId} = '' OR c.id = ${contactUuid}::uuid)
+      AND (
+        ${filter} = ''
+        OR (${filter} = 'whatsapp' AND COALESCE(conversation_summary.conversation_count, 0) > 0)
+        OR (${filter} = 'cash' AND COALESCE(cash_summary.loyalty_count, 0) > 0)
+        OR (${filter} = 'memory' AND COALESCE(memory_summary.memory_count, 0) > 0)
+        OR (${filter} = 'review' AND (COALESCE(quality_summary.data_quality_count, 0) > 0 OR COALESCE(merge_summary.merge_candidate_count, 0) > 0))
+      )
+      AND (
+        ${search} = ''
+        OR c.display_name ILIKE ${`%${search}%`}
+        OR c.phone ILIKE ${`%${search}%`}
+        OR c.email ILIKE ${`%${search}%`}
+        OR phone_identity.normalized_value ILIKE ${`%${search}%`}
+      )
+    ORDER BY last_touch.last_touch_at DESC NULLS LAST, c.created_at DESC
+    LIMIT ${limit}
+    OFFSET ${skip}
+  `
+  const countRows = await prisma.$queryRaw`
+    SELECT count(*)::int AS count
+    FROM platform.contacts AS c
+    LEFT JOIN LATERAL (
+      SELECT ci.normalized_value
+      FROM platform.contact_identities AS ci
+      WHERE ci.contact_id = c.id
+        AND ci.identity_type IN ('phone', 'whatsapp')
+        AND ci.normalized_value IS NOT NULL
+      LIMIT 1
+    ) AS phone_identity ON true
+    WHERE c.tenant_id = ${tenantId}::uuid
+      AND (${contactId} = '' OR c.id = ${contactUuid}::uuid)
+      AND (
+        ${filter} = ''
+        OR (${filter} = 'whatsapp' AND EXISTS (SELECT 1 FROM conversaflow.conversations AS cv WHERE cv.contact_id = c.id))
+        OR (${filter} = 'cash' AND EXISTS (SELECT 1 FROM cash.loyalty_accounts AS la WHERE la.contact_id = c.id))
+        OR (${filter} = 'memory' AND EXISTS (SELECT 1 FROM conversaflow.memory_items AS mi WHERE mi.contact_id = c.id))
+        OR (${filter} = 'review' AND (
+          EXISTS (SELECT 1 FROM observability.data_quality_findings AS dq WHERE dq.tenant_id = c.tenant_id AND dq.status = 'open' AND dq.subject_id = c.id::text)
+          OR EXISTS (SELECT 1 FROM platform.contact_merge_candidates AS mc WHERE mc.tenant_id = c.tenant_id AND mc.confidence IN ('candidate', 'high') AND (mc.left_contact_id = c.id OR mc.right_contact_id = c.id))
+        ))
+      )
+      AND (
+        ${search} = ''
+        OR c.display_name ILIKE ${`%${search}%`}
+        OR c.phone ILIKE ${`%${search}%`}
+        OR c.email ILIKE ${`%${search}%`}
+        OR phone_identity.normalized_value ILIKE ${`%${search}%`}
+      )
+  `
+  const customers = rows.map((row) => platformCustomerDto(row, capabilities))
+  const total = Number(countRows[0]?.count || customers.length)
+  return { customers, total, page, totalPages: Math.max(1, Math.ceil(total / limit)), source: 'platform.contacts' }
+}
+
+async function loadPlatformCustomerDetail(capabilities, contactId) {
+  if (!isUuid(contactId)) return null
+  const list = await loadPlatformCustomers(capabilities, { page: 1, limit: 1, search: '', contactId })
+  const customer = list.customers[0] || null
+  if (!customer) return null
+  const [timeline, conversations, orders, cash, identity] = await Promise.all([
+    loadPlatformCustomerTimeline(capabilities, contactId),
+    loadPlatformCustomerConversations(capabilities, contactId),
+    loadPlatformCustomerOrders(capabilities, contactId),
+    loadPlatformCustomerCash(capabilities, contactId),
+    loadPlatformCustomerIdentity(capabilities, contactId),
+  ])
+  return { customer, timeline, conversations, orders, cash, identity }
+}
+
+async function loadPlatformCustomerTimeline(capabilities, contactId) {
+  const rows = await prisma.$queryRaw`
+    SELECT * FROM (
+      SELECT 'whatsapp_message' AS type, m.id::text AS id, m.created_at AS occurred_at, m.role AS label, COALESCE(m.body, m.payload->>'content', '') AS detail, 'conversaflow' AS product
+      FROM conversaflow.messages AS m
+      WHERE m.contact_id = ${contactId}::uuid AND m.tenant_id = ${capabilities.tenant.id}::uuid
+      UNION ALL
+      SELECT 'order' AS type, o.id::text AS id, COALESCE(o.placed_at, o.created_at) AS occurred_at, o.status AS label, COALESCE(o.order_number, o.source_ref, o.id::text) AS detail, 'orders' AS product
+      FROM commerce.orders AS o
+      WHERE o.contact_id = ${contactId}::uuid AND o.tenant_id = ${capabilities.tenant.id}::uuid
+      UNION ALL
+      SELECT 'memory' AS type, mi.id::text AS id, mi.updated_at AS occurred_at, mi.memory_type AS label, mi.content AS detail, 'memory' AS product
+      FROM conversaflow.memory_items AS mi
+      WHERE mi.contact_id = ${contactId}::uuid AND mi.tenant_id = ${capabilities.tenant.id}::uuid
+      UNION ALL
+      SELECT 'data_quality' AS type, dq.id::text AS id, dq.created_at AS occurred_at, dq.severity AS label, dq.finding_key AS detail, 'data' AS product
+      FROM observability.data_quality_findings AS dq
+      WHERE dq.tenant_id = ${capabilities.tenant.id}::uuid AND dq.subject_id = ${contactId}
+    ) AS timeline
+    ORDER BY occurred_at DESC
+    LIMIT 80
+  `
+  return rows.map((row) => ({ ...row, occurredAt: iso(row.occurred_at) }))
+}
+
+async function loadPlatformCustomerConversations(capabilities, contactId) {
+  const rows = await prisma.$queryRaw`
+    SELECT
+      cv.id::text,
+      cv.status,
+      cv.opened_at,
+      cv.closed_at,
+      cv.updated_at,
+      cv.metadata,
+      count(m.id)::int AS "messageCount",
+      max(m.created_at) AS "lastMessageAt"
+    FROM conversaflow.conversations AS cv
+    LEFT JOIN conversaflow.messages AS m ON m.conversation_id = cv.id
+    WHERE cv.contact_id = ${contactId}::uuid
+      AND cv.tenant_id = ${capabilities.tenant.id}::uuid
+    GROUP BY cv.id
+    ORDER BY cv.updated_at DESC
+    LIMIT 40
+  `
+  return rows.map((row) => ({
+    id: row.id,
+    status: row.status,
+    openedAt: iso(row.opened_at),
+    closedAt: iso(row.closed_at),
+    updatedAt: iso(row.updated_at),
+    lastMessageAt: iso(row.lastMessageAt),
+    messageCount: Number(row.messageCount || 0),
+    summary: row.metadata?.summary || row.metadata?.current_state || '',
+  }))
+}
+
+async function loadPlatformCustomerOrders(capabilities, contactId) {
+  const rows = await prisma.$queryRaw`
+    SELECT
+      id::text,
+      order_number,
+      source_product,
+      status,
+      channel,
+      total_cents,
+      placed_at,
+      created_at,
+      updated_at
+    FROM commerce.orders
+    WHERE contact_id = ${contactId}::uuid
+      AND tenant_id = ${capabilities.tenant.id}::uuid
+    ORDER BY COALESCE(placed_at, created_at) DESC
+    LIMIT 40
+  `
+  return rows.map((row) => ({
+    id: row.id,
+    orderNumber: row.order_number,
+    sourceProduct: row.source_product,
+    status: row.status,
+    channel: row.channel,
+    totalCents: Number(row.total_cents || 0),
+    total: centsToMoney(Number(row.total_cents || 0)),
+    placedAt: iso(row.placed_at || row.created_at),
+    updatedAt: iso(row.updated_at),
+  }))
+}
+
+async function loadPlatformCustomerCash(capabilities, contactId) {
+  const rows = await prisma.$queryRaw`
+    SELECT
+      la.id::text AS "loyaltyAccountId",
+      la.status,
+      lc.id::text AS "loyaltyCardId",
+      lc.card_number,
+      lc.balance_cents,
+      lc.total_visits,
+      lc.visits_this_cycle,
+      lc.pending_rewards,
+      lc.created_at,
+      lc.updated_at
+    FROM cash.loyalty_accounts AS la
+    LEFT JOIN cash.loyalty_cards AS lc ON lc.loyalty_account_id = la.id
+    WHERE la.contact_id = ${contactId}::uuid
+      AND la.tenant_id = ${capabilities.tenant.id}::uuid
+    ORDER BY la.created_at DESC
+    LIMIT 1
+  `
+  const row = rows[0]
+  if (!row) return { available: productAvailable(capabilities, 'cash'), source: 'cash', account: null }
+  return {
+    available: productAvailable(capabilities, 'cash'),
+    source: 'cash',
+    account: {
+      loyaltyAccountId: row.loyaltyAccountId,
+      status: row.status,
+      loyaltyCardId: row.loyaltyCardId,
+      cardNumber: row.card_number,
+      balanceCents: Number(row.balance_cents || 0),
+      balance: centsToMoney(Number(row.balance_cents || 0)),
+      totalVisits: Number(row.total_visits || 0),
+      visitsThisCycle: Number(row.visits_this_cycle || 0),
+      pendingRewards: Number(row.pending_rewards || 0),
+      createdAt: iso(row.created_at),
+      updatedAt: iso(row.updated_at),
+    },
+  }
+}
+
+async function loadPlatformCustomerIdentity(capabilities, contactId) {
+  const [identities, candidates, findings] = await Promise.all([
+    prisma.$queryRaw`
+      SELECT id::text, identity_type, identity_value, normalized_value, provider, verification_status, confidence, metadata, created_at
+      FROM platform.contact_identities
+      WHERE contact_id = ${contactId}::uuid
+        AND tenant_id = ${capabilities.tenant.id}::uuid
+      ORDER BY identity_type, created_at
+    `,
+    prisma.$queryRaw`
+      SELECT id::text, left_contact_id::text, right_contact_id::text, match_type, confidence, detail, created_at, resolved_at
+      FROM platform.contact_merge_candidates
+      WHERE tenant_id = ${capabilities.tenant.id}::uuid
+        AND (left_contact_id = ${contactId}::uuid OR right_contact_id = ${contactId}::uuid)
+      ORDER BY created_at DESC
+      LIMIT 20
+    `,
+    prisma.$queryRaw`
+      SELECT id::text, severity, finding_key, detail, status, created_at, resolved_at
+      FROM observability.data_quality_findings
+      WHERE tenant_id = ${capabilities.tenant.id}::uuid
+        AND subject_id = ${contactId}
+      ORDER BY created_at DESC
+      LIMIT 20
+    `,
+  ])
+  return {
+    identities: identities.map((row) => ({ ...row, createdAt: iso(row.created_at) })),
+    mergeCandidates: candidates.map((row) => ({ ...row, createdAt: iso(row.created_at), resolvedAt: iso(row.resolved_at) })),
+    findings: findings.map((row) => ({ ...row, createdAt: iso(row.created_at), resolvedAt: iso(row.resolved_at) })),
+  }
+}
+
+function mergeLegacyCustomer(map, partial) {
+  const key = partial.normalizedPhone || partial.id
+  const existing = map.get(key) || {
+    id: key.startsWith('+') ? `phone:${key}` : key,
+    displayName: partial.displayName || 'Unknown customer',
+    phone: partial.phone || '',
+    normalizedPhone: partial.normalizedPhone || null,
+    email: partial.email || '',
+    createdAt: partial.createdAt || null,
+    lastTouchAt: partial.lastTouchAt || partial.createdAt || null,
+    products: {
+      whatsapp: { available: false, active: false, source: 'none' },
+      cash: { available: false, active: false, source: 'none' },
+      orders: { available: false, active: false, source: 'none' },
+      giftCards: { available: false, active: false, source: 'none' },
+    },
+    value: { orders: 0, totalSpendCents: 0, totalSpend: centsToMoney(0), visits: 0, walletBalanceCents: 0, walletBalance: centsToMoney(0) },
+    memory: { factsCount: 0, embeddingHealth: 'fallback', summary: 'Legacy phone match fallback' },
+    dataQuality: { mergeCandidates: 0, findings: 0, needsReview: false },
+    identities: [],
+    sourceRefs: [],
+  }
+  const lastTouchAt = [existing.lastTouchAt, partial.lastTouchAt].filter(Boolean).sort().at(-1) || existing.lastTouchAt
+  existing.displayName = existing.displayName === 'Unknown customer' ? (partial.displayName || existing.displayName) : existing.displayName
+  existing.phone = existing.phone || partial.phone || ''
+  existing.email = existing.email || partial.email || ''
+  existing.lastTouchAt = lastTouchAt
+  existing.createdAt = existing.createdAt || partial.createdAt || null
+  existing.sourceRefs.push(partial.sourceRef)
+  if (partial.cash) {
+    existing.products.cash = { available: true, active: true, source: 'cash' }
+    existing.products.giftCards.available = true
+    existing.value.visits += partial.cash.totalVisits || 0
+    existing.value.walletBalanceCents += partial.cash.walletBalanceCents || 0
+    existing.value.walletBalance = centsToMoney(existing.value.walletBalanceCents)
+  }
+  if (partial.whatsapp) {
+    existing.products.whatsapp = { available: true, active: true, source: 'conversaflow' }
+    existing.products.whatsapp.conversations = (existing.products.whatsapp.conversations || 0) + (partial.whatsapp.conversations || 0)
+    existing.products.whatsapp.activeConversations = partial.whatsapp.activeConversations || 0
+    existing.value.orders += partial.whatsapp.outcomes || 0
+    existing.memory.factsCount += partial.whatsapp.factsCount || 0
+    existing.memory.summary = existing.memory.factsCount > 0 ? `${existing.memory.factsCount} extracted fact group${existing.memory.factsCount === 1 ? '' : 's'}` : existing.memory.summary
+  }
+  existing.status = existing.products.whatsapp.active || existing.products.cash.active ? 'active' : 'new'
+  map.set(key, existing)
+}
+
+async function loadLegacyCustomers(capabilities, options = {}) {
+  const page = Math.max(1, parseInt(options.page || '1') || 1)
+  const limit = Math.max(1, Math.min(parseInt(options.limit || '20') || 20, 100))
+  const search = String(options.search || '').trim().slice(0, 80).toLowerCase()
+  const filter = String(options.filter || '').trim().slice(0, 24)
+  const ctx = await getDashboardContext(capabilities.tenant.slug, null)
+  const map = new Map()
+
+  if (productAvailable(capabilities, 'cash')) {
+    const users = await prisma.user.findMany({
+      where: { tenantId: ctx.cashTenantId, role: 'CUSTOMER' },
+      include: { card: { include: { visits: { orderBy: { scannedAt: 'desc' }, take: 1 } } } },
+      orderBy: { createdAt: 'desc' },
+      take: 500,
+    })
+    users.forEach((user) => mergeLegacyCustomer(map, {
+      id: `cash:${user.id}`,
+      displayName: user.name,
+      phone: user.phone,
+      normalizedPhone: normalizeCustomerPhone(user.phone),
+      email: user.email,
+      createdAt: iso(user.createdAt),
+      lastTouchAt: iso(user.card?.visits?.[0]?.scannedAt || user.updatedAt),
+      cash: {
+        totalVisits: user.card?.totalVisits || 0,
+        walletBalanceCents: user.card?.balanceCentavos || 0,
+      },
+      sourceRef: { product: 'cash', id: user.id },
+    }))
+  }
+
+  if (productAvailable(capabilities, 'conversaflow') && ctx.businessId) {
+    const rows = await prisma.$queryRaw`
+      SELECT
+        c.id::text,
+        c.name,
+        c.phone,
+        c.created_at,
+        count(DISTINCT cv.id)::int AS conversation_count,
+        count(DISTINCT co.id)::int AS outcome_count,
+        count(DISTINCT cp.customer_id)::int AS facts_count,
+        max(COALESCE(cv.last_message_at, cv.created_at, c.created_at)) AS last_touch_at
+      FROM conversaflow.customers AS c
+      LEFT JOIN conversaflow.conversations AS cv ON cv.customer_id = c.id
+      LEFT JOIN conversaflow.conversation_outcomes AS co ON co.customer_id = c.id
+      LEFT JOIN conversaflow.customer_preferences AS cp ON cp.customer_id = c.id AND cp.facts <> '{}'::jsonb
+      WHERE c.business_id = ${ctx.businessId}::uuid
+      GROUP BY c.id
+      ORDER BY max(COALESCE(cv.last_message_at, cv.created_at, c.created_at)) DESC NULLS LAST
+      LIMIT 500
+    `
+    rows.forEach((row) => mergeLegacyCustomer(map, {
+      id: `conversaflow:${row.id}`,
+      displayName: row.name,
+      phone: row.phone,
+      normalizedPhone: normalizeCustomerPhone(row.phone),
+      createdAt: iso(row.created_at),
+      lastTouchAt: iso(row.last_touch_at),
+      whatsapp: {
+        conversations: Number(row.conversation_count || 0),
+        outcomes: Number(row.outcome_count || 0),
+        factsCount: Number(row.facts_count || 0),
+      },
+      sourceRef: { product: 'conversaflow', id: row.id },
+    }))
+  }
+
+  let rows = Array.from(map.values())
+  rows.forEach((row) => {
+    row.products.cash.available = productAvailable(capabilities, 'cash')
+    row.products.giftCards.available = productAvailable(capabilities, 'cash')
+    row.products.whatsapp.available = productAvailable(capabilities, 'conversaflow')
+    row.products.orders.available = productAvailable(capabilities, 'kds') || productAvailable(capabilities, 'conversaflow')
+  })
+  if (search) {
+    rows = rows.filter((row) => [
+      row.displayName,
+      row.phone,
+      row.normalizedPhone,
+      row.email,
+    ].some((value) => String(value || '').toLowerCase().includes(search)))
+  }
+  if (filter) {
+    rows = rows.filter((row) => {
+      if (filter === 'whatsapp') return row.products.whatsapp.active
+      if (filter === 'cash') return row.products.cash.active
+      if (filter === 'memory') return row.memory.factsCount > 0
+      if (filter === 'review') return row.dataQuality.needsReview
+      return true
+    })
+  }
+  rows.sort((a, b) => String(b.lastTouchAt || '').localeCompare(String(a.lastTouchAt || '')))
+  const total = rows.length
+  const start = (page - 1) * limit
+  return { customers: rows.slice(start, start + limit), total, page, totalPages: Math.max(1, Math.ceil(total / limit)), source: 'legacy-phone-fallback' }
+}
+
 async function callKdsPairingBackend(action, body) {
   const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -624,6 +1209,68 @@ function _sha256Hex(value) {
 
 function _hashPin(pin, salt) {
   return _sha256Hex(`${salt}:${pin}`)
+}
+
+function kdsRevokedPayload() {
+  return {
+    error: 'device_revoked',
+    message: 'This KDS device has been removed. Pair it again from the dashboard.',
+  }
+}
+
+function kdsTokenMissingPayload() {
+  return {
+    error: 'device_revoked',
+    message: 'This KDS device has been removed. Pair it again from the dashboard.',
+  }
+}
+
+async function verifyLocalKdsDevice(req) {
+  const token = String(req.get('X-KDS-Device-Token') || '').trim()
+  if (!token) {
+    const err = new Error('device_token_missing')
+    err.status = 401
+    err.payload = kdsTokenMissingPayload()
+    throw err
+  }
+
+  const rows = await prisma.$queryRaw`
+    SELECT *
+    FROM kds.device_sessions
+    WHERE token_hash = ${_sha256Hex(token)}
+    LIMIT 1
+  `
+  const row = rows[0]
+  if (!row || row.is_active !== true) {
+    const err = new Error('device_revoked')
+    err.status = 403
+    err.payload = kdsRevokedPayload()
+    throw err
+  }
+
+  const deviceId = String(row.id || row.device_id)
+  if (PLATFORM_TRANSITION_SCHEMA) {
+    await prisma.$executeRaw`
+      UPDATE kds.device_sessions
+      SET last_seen_at = now()
+      WHERE id = ${deviceId}::uuid
+    `
+  } else {
+    await prisma.$executeRaw`
+      UPDATE kds.device_sessions
+      SET last_used_at = now()
+      WHERE device_id = ${deviceId}::uuid
+    `
+  }
+
+  return {
+    deviceId,
+    tenantId: row.tenant_id ? String(row.tenant_id) : null,
+    businessId: row.business_id ? String(row.business_id) : (row.tenant_id ? String(row.tenant_id) : null),
+    locationId: row.location_id ? String(row.location_id) : null,
+    stationId: row.station_id ? String(row.station_id) : null,
+    deviceName: row.device_name || null,
+  }
 }
 
 async function callKdsPairingLocal(action, body) {
@@ -849,6 +1496,171 @@ app.post('/api/kds/pairing', async (req, res) => {
   }
 })
 
+app.post('/api/kds/board', async (req, res) => {
+  const action = String((req.body || {}).action || '').trim()
+  if (!['snapshot', 'events', 'session_status'].includes(action)) {
+    return res.status(400).json({ error: 'unknown_action' })
+  }
+
+  try {
+    const device = await verifyLocalKdsDevice(req)
+
+    if (action === 'session_status') {
+      return res.json({ ok: true, device_id: device.deviceId })
+    }
+
+    if (action === 'events') {
+      return res.json({ ok: true, data: [] })
+    }
+
+    if (PLATFORM_TRANSITION_SCHEMA) {
+      const rows = await prisma.$queryRaw`
+        SELECT
+          t.id::text AS ticket_id,
+          t.id::text AS source_transaction_id,
+          t.tenant_id::text AS business_id,
+          'whatsapp'::text AS source_channel,
+          t.status::text,
+          t.station_id::text,
+          s.name AS station_name,
+          t.customer_name,
+          t.customer_phone,
+          NULL::text AS pickup_person,
+          t.customer_note,
+          NULL::text AS cancellation_reason,
+          NULL::text AS partial_cancellation_reason,
+          (t.total_cents::numeric / 100.0) AS total_amount,
+          t.created_at,
+          t.updated_at,
+          NULL::bigint AS last_event_sequence,
+          COALESCE(
+            jsonb_agg(
+              jsonb_build_object(
+                'ticket_item_id', i.id::text,
+                'name', i.name,
+                'quantity', i.quantity,
+                'variant_name', i.variant_name,
+                'notes', i.notes,
+                'is_cancelled', i.is_cancelled,
+                'unit_price', (i.unit_price_cents::numeric / 100.0),
+                'display_order', i.display_order
+              )
+              ORDER BY i.display_order ASC
+            ) FILTER (WHERE i.id IS NOT NULL),
+            '[]'::jsonb
+          ) AS items
+        FROM kds.tickets AS t
+        LEFT JOIN kds.stations AS s
+          ON s.id = t.station_id
+        LEFT JOIN kds.ticket_items AS i
+          ON i.ticket_id = t.id
+        WHERE t.tenant_id = ${device.tenantId}::uuid
+          AND (${device.locationId}::uuid IS NULL OR t.location_id IS NOT DISTINCT FROM ${device.locationId}::uuid)
+          AND (${device.stationId}::uuid IS NULL OR t.station_id IS NOT DISTINCT FROM ${device.stationId}::uuid OR t.station_id IS NULL)
+          AND t.status::text IN ('new', 'accepted', 'preparing', 'ready', 'partial_cancelled')
+        GROUP BY t.id, s.id
+        ORDER BY t.created_at ASC
+        LIMIT 200
+      `
+      return res.json({ ok: true, data: rows })
+    }
+
+    const rows = await prisma.$queryRaw`
+      SELECT *
+      FROM kds.get_board_snapshot(${device.businessId}::uuid, ${device.stationId})
+    `
+    return res.json({ ok: true, data: rows })
+  } catch (err) {
+    console.error('[kds board local]', err.message)
+    return res.status(err.status || 500).json(err.payload || { error: err.message })
+  }
+})
+
+app.post('/api/kds/command', async (req, res) => {
+  const action = String((req.body || {}).action || '').trim()
+  if (!action) return res.status(400).json({ error: 'missing_action' })
+
+  try {
+    const device = await verifyLocalKdsDevice(req)
+
+    if (action === 'transition_ticket') {
+      const targetStatus = req.body.target_status
+      const ticketId = String(req.body.ticket_id || '').trim()
+      if (!ticketId || !ORDER_STATUS_MAP.all.includes(targetStatus)) {
+        return res.status(400).json({ error: 'missing_required_fields' })
+      }
+
+      if (PLATFORM_TRANSITION_SCHEMA) {
+        const rows = await prisma.$queryRaw`
+          UPDATE kds.tickets
+          SET status = ${targetStatus}, updated_at = now()
+          WHERE id = ${ticketId}::uuid
+            AND tenant_id = ${device.tenantId}::uuid
+            AND (${device.locationId}::uuid IS NULL OR location_id IS NOT DISTINCT FROM ${device.locationId}::uuid)
+            AND (${device.stationId}::uuid IS NULL OR station_id IS NOT DISTINCT FROM ${device.stationId}::uuid OR station_id IS NULL)
+          RETURNING id::text AS ticket_id, status
+        `
+        if (!rows[0]) return res.status(404).json({ error: 'Ticket not found' })
+        return res.json({ ok: true, data: rows[0] })
+      }
+
+      const rows = await prisma.$queryRaw`
+        SELECT kds.transition_ticket(
+          ${ticketId}::uuid,
+          ${targetStatus}::kds.ticket_status,
+          'kds_app',
+          ${device.deviceId},
+          ${device.stationId}
+        ) AS data
+      `
+      return res.json({ ok: true, data: rows[0]?.data ?? null })
+    }
+
+    if (action === 'partial_cancel_items') {
+      const ticketId = String(req.body.ticket_id || '').trim()
+      const itemIds = Array.isArray(req.body.item_ids) ? req.body.item_ids : []
+      if (!ticketId || itemIds.length === 0) return res.status(400).json({ error: 'missing_required_fields' })
+
+      if (PLATFORM_TRANSITION_SCHEMA) {
+        const [, rows] = await prisma.$transaction([
+          prisma.$executeRaw`
+            UPDATE kds.ticket_items
+            SET is_cancelled = true
+            WHERE ticket_id = ${ticketId}::uuid
+              AND id IN (${Prisma.join(itemIds.map((id) => Prisma.sql`${String(id)}::uuid`))})
+              AND EXISTS (
+                SELECT 1
+                FROM kds.tickets AS t
+                WHERE t.id = kds.ticket_items.ticket_id
+                  AND t.tenant_id = ${device.tenantId}::uuid
+                  AND (${device.locationId}::uuid IS NULL OR t.location_id IS NOT DISTINCT FROM ${device.locationId}::uuid)
+                  AND (${device.stationId}::uuid IS NULL OR t.station_id IS NOT DISTINCT FROM ${device.stationId}::uuid OR t.station_id IS NULL)
+              )
+          `,
+          prisma.$queryRaw`
+            UPDATE kds.tickets
+            SET status = 'partial_cancelled', updated_at = now()
+            WHERE id = ${ticketId}::uuid
+              AND tenant_id = ${device.tenantId}::uuid
+              AND (${device.locationId}::uuid IS NULL OR location_id IS NOT DISTINCT FROM ${device.locationId}::uuid)
+              AND (${device.stationId}::uuid IS NULL OR station_id IS NOT DISTINCT FROM ${device.stationId}::uuid OR station_id IS NULL)
+            RETURNING id::text AS ticket_id, status
+          `,
+        ])
+        if (!rows[0]) return res.status(404).json({ error: 'Ticket not found' })
+        return res.json({ ok: true, data: rows[0] })
+      }
+
+      return res.status(409).json({ error: 'partial_cancel_items is not implemented in local legacy mode' })
+    }
+
+    return res.status(400).json({ error: 'unknown_action' })
+  } catch (err) {
+    console.error('[kds command local]', err.message)
+    return res.status(err.status || 500).json(err.payload || { error: err.message })
+  }
+})
+
 app.get('/api/me/tenants', async (req, res) => {
   try {
     const userId = getCurrentUserId(req)
@@ -970,6 +1782,191 @@ app.patch('/api/tenants/:tenantId/locations/:locationId', async (req, res) => {
   }
 })
 
+app.get('/api/tenants/:tenantId/customers', async (req, res) => {
+  try {
+    const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
+    if (!capabilities) return null
+    const payload = PLATFORM_TRANSITION_SCHEMA
+      ? await loadPlatformCustomers(capabilities, req.query)
+      : await loadLegacyCustomers(capabilities, req.query)
+    return res.json(payload)
+  } catch (err) {
+    console.error('[tenant customers GET]', err.message)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/tenants/:tenantId/customers/:contactId', async (req, res) => {
+  try {
+    const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
+    if (!capabilities) return null
+    if (!PLATFORM_TRANSITION_SCHEMA) {
+      const payload = await loadLegacyCustomers(capabilities, { page: 1, limit: 500 })
+      const customer = payload.customers.find((row) => row.id === req.params.contactId)
+      if (!customer) return res.status(404).json({ error: 'customer_not_found' })
+      return res.json({
+        customer,
+        timeline: [],
+        conversations: [],
+        orders: [],
+        cash: { available: productAvailable(capabilities, 'cash'), source: 'legacy-phone-fallback', account: null },
+        identity: {
+          identities: customer.normalizedPhone ? [{
+            identity_type: 'phone',
+            identity_value: customer.phone,
+            normalized_value: customer.normalizedPhone,
+            verification_status: 'unverified',
+            confidence: 'candidate',
+          }] : [],
+          mergeCandidates: [],
+          findings: [],
+        },
+      })
+    }
+    const detail = await loadPlatformCustomerDetail(capabilities, req.params.contactId)
+    if (!detail) return res.status(404).json({ error: 'customer_not_found' })
+    return res.json(detail)
+  } catch (err) {
+    console.error('[tenant customer detail GET]', err.message)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/tenants/:tenantId/customers/:contactId/timeline', async (req, res) => {
+  try {
+    const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
+    if (!capabilities) return null
+    const timeline = PLATFORM_TRANSITION_SCHEMA
+      ? await loadPlatformCustomerTimeline(capabilities, req.params.contactId)
+      : []
+    return res.json({ timeline })
+  } catch (err) {
+    console.error('[tenant customer timeline GET]', err.message)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/tenants/:tenantId/customers/:contactId/conversations', async (req, res) => {
+  try {
+    const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
+    if (!capabilities) return null
+    const conversations = PLATFORM_TRANSITION_SCHEMA
+      ? await loadPlatformCustomerConversations(capabilities, req.params.contactId)
+      : []
+    return res.json({ conversations })
+  } catch (err) {
+    console.error('[tenant customer conversations GET]', err.message)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/tenants/:tenantId/customers/:contactId/orders', async (req, res) => {
+  try {
+    const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
+    if (!capabilities) return null
+    const orders = PLATFORM_TRANSITION_SCHEMA
+      ? await loadPlatformCustomerOrders(capabilities, req.params.contactId)
+      : []
+    return res.json({ orders })
+  } catch (err) {
+    console.error('[tenant customer orders GET]', err.message)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/tenants/:tenantId/customers/:contactId/cash', async (req, res) => {
+  try {
+    const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
+    if (!capabilities) return null
+    const cash = PLATFORM_TRANSITION_SCHEMA
+      ? await loadPlatformCustomerCash(capabilities, req.params.contactId)
+      : { available: productAvailable(capabilities, 'cash'), source: 'legacy-phone-fallback', account: null }
+    return res.json(cash)
+  } catch (err) {
+    console.error('[tenant customer cash GET]', err.message)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/tenants/:tenantId/customers/:contactId/identity', async (req, res) => {
+  try {
+    const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
+    if (!capabilities) return null
+    const identity = PLATFORM_TRANSITION_SCHEMA
+      ? await loadPlatformCustomerIdentity(capabilities, req.params.contactId)
+      : { identities: [], mergeCandidates: [], findings: [] }
+    return res.json(identity)
+  } catch (err) {
+    console.error('[tenant customer identity GET]', err.message)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/tenants/:tenantId/insights/customer-platform', async (req, res) => {
+  try {
+    const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
+    if (!capabilities) return null
+    const customersPayload = PLATFORM_TRANSITION_SCHEMA
+      ? await loadPlatformCustomers(capabilities, { page: 1, limit: 100 })
+      : await loadLegacyCustomers(capabilities, { page: 1, limit: 500 })
+    const customers = customersPayload.customers || []
+    const whatsappCustomers = customers.filter((customer) => customer.products?.whatsapp?.active).length
+    const cashCustomers = customers.filter((customer) => customer.products?.cash?.active).length
+    const needsReview = customers.filter((customer) => customer.dataQuality?.needsReview).length
+    const memoryReady = customers.filter((customer) => customer.memory?.factsCount > 0).length
+    const activeConversations = customers.reduce((sum, customer) => sum + (customer.products?.whatsapp?.activeConversations || 0), 0)
+    return res.json({
+      source: customersPayload.source,
+      generatedAt: new Date().toISOString(),
+      metrics: {
+        totalCustomers: customersPayload.total,
+        whatsappCustomers,
+        cashCustomers,
+        memoryReady,
+        needsReview,
+        activeConversations,
+      },
+      insights: [
+        {
+          key: 'customer-growth',
+          label: 'Customer base',
+          value: customersPayload.total,
+          action: 'Open Customers',
+          target: '/customers',
+          status: customersPayload.total > 0 ? 'ready' : 'empty',
+        },
+        {
+          key: 'whatsapp-health',
+          label: 'WhatsApp customers',
+          value: whatsappCustomers,
+          action: 'Review WhatsApp tab',
+          target: '/customers?filter=whatsapp',
+          status: productAvailable(capabilities, 'conversaflow') ? 'ready' : 'unavailable',
+        },
+        {
+          key: 'memory-health',
+          label: 'Memory context ready',
+          value: memoryReady,
+          action: 'Review customers without memory',
+          target: '/customers?filter=memory',
+          status: memoryReady > 0 ? 'ready' : 'needs_attention',
+        },
+        {
+          key: 'identity-quality',
+          label: 'Identity review',
+          value: needsReview,
+          action: 'Review Data tabs',
+          target: '/customers?filter=review',
+          status: needsReview > 0 ? 'needs_attention' : 'ready',
+        },
+      ],
+    })
+  } catch (err) {
+    console.error('[tenant customer insights GET]', err.message)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
 app.all('/api/tenants/:tenantId/conversaflow/conversations', async (req, res) => {
   const slug = await tenantSlugForRoute(req, res, 'conversaflow')
   if (!slug) return null
@@ -1040,6 +2037,12 @@ app.all('/api/tenants/:tenantId/kds/devices/pairing/:pairingId/:action', async (
   const slug = await tenantSlugForRoute(req, res, 'kds')
   if (!slug) return null
   return redirectWithQuery(req, res, `/api/${slug}/admin/devices/pairing/${req.params.pairingId}/${req.params.action}`)
+})
+
+app.all('/api/tenants/:tenantId/kds/devices/:deviceId/revoke', async (req, res) => {
+  const slug = await tenantSlugForRoute(req, res, 'kds')
+  if (!slug) return null
+  return redirectWithQuery(req, res, `/api/${slug}/admin/devices/${req.params.deviceId}/revoke`)
 })
 
 app.all('/api/tenants/:tenantId/kds/devices/:deviceId', async (req, res) => {
@@ -2207,6 +3210,53 @@ app.post('/api/:slug/admin/devices/provision', async (req, res) => {
   }
 })
 
+app.post('/api/:slug/admin/devices/:deviceId/revoke', async (req, res) => {
+  try {
+    const ctx = await getDashboardContext(req.params.slug, req.query.locationId || null)
+    if (!ctx) return notFound(res)
+    if (!ctx.businessId) return businessNotLinked(res)
+
+    const reason = String(req.body.reason || 'removed_from_dashboard').trim() || 'removed_from_dashboard'
+    const revokedBy = getCurrentUserId(req)
+
+    if (PLATFORM_TRANSITION_SCHEMA) {
+      const rows = await prisma.$queryRaw`
+        UPDATE kds.device_sessions
+        SET
+          is_active = false,
+          revoked_at = COALESCE(revoked_at, now()),
+          revoked_by = COALESCE(${revokedBy}::uuid, revoked_by),
+          revocation_reason = ${reason}
+        WHERE id = ${req.params.deviceId}::uuid
+          AND tenant_id = ${ctx.tenantId}::uuid
+          AND (${ctx.locationId}::uuid IS NULL OR location_id IS NOT DISTINCT FROM ${ctx.locationId}::uuid)
+        RETURNING id::text AS device_id, revoked_at
+      `
+      if (!rows[0]) return res.status(404).json({ error: 'Device not found' })
+      _kdsHeartbeats.delete(req.params.deviceId)
+      return res.json({ ok: true, device_id: rows[0].device_id, revoked_at: rows[0].revoked_at })
+    }
+
+    const rows = await prisma.$queryRaw`
+      UPDATE kds.device_sessions
+      SET
+        is_active = false,
+        revoked_at = COALESCE(revoked_at, now()),
+        revoked_by = COALESCE(${revokedBy}::uuid, revoked_by),
+        revocation_reason = ${reason}
+      WHERE device_id = ${req.params.deviceId}::uuid
+        AND business_id = ${ctx.businessId}::uuid
+      RETURNING device_id::text, revoked_at
+    `
+    if (!rows[0]) return res.status(404).json({ error: 'Device not found' })
+    _kdsHeartbeats.delete(req.params.deviceId)
+    return res.json({ ok: true, device_id: rows[0].device_id, revoked_at: rows[0].revoked_at })
+  } catch (err) {
+    console.error('[devices revoke]', err.message)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
 app.patch('/api/:slug/admin/devices/:deviceId', async (req, res) => {
   try {
     const ctx = await getDashboardContext(req.params.slug, req.query.locationId || null)
@@ -2214,11 +3264,25 @@ app.patch('/api/:slug/admin/devices/:deviceId', async (req, res) => {
     if (!ctx.businessId) return businessNotLinked(res)
 
     const isActive = req.body.is_active ?? req.body.isActive
+    const revokedBy = getCurrentUserId(req)
+    const shouldRevoke = isActive === false
     if (PLATFORM_TRANSITION_SCHEMA) {
       const rows = await prisma.$queryRaw`
         UPDATE kds.device_sessions
         SET
           is_active = COALESCE(${typeof isActive === 'boolean' ? isActive : null}, is_active),
+          revoked_at = CASE
+            WHEN ${shouldRevoke} THEN COALESCE(revoked_at, now())
+            ELSE revoked_at
+          END,
+          revoked_by = CASE
+            WHEN ${shouldRevoke} THEN COALESCE(${revokedBy}::uuid, revoked_by)
+            ELSE revoked_by
+          END,
+          revocation_reason = CASE
+            WHEN ${shouldRevoke} THEN COALESCE(${req.body.revocation_reason || req.body.reason || 'removed_from_dashboard'}, revocation_reason)
+            ELSE revocation_reason
+          END,
           device_name = CASE
             WHEN ${Object.prototype.hasOwnProperty.call(req.body, 'device_name')} THEN ${String(req.body.device_name || '').trim()}
             ELSE device_name
@@ -2233,12 +3297,25 @@ app.patch('/api/:slug/admin/devices/:deviceId', async (req, res) => {
         RETURNING id::text
       `
       if (!rows[0]) return res.status(404).json({ error: 'Device not found' })
+      if (shouldRevoke) _kdsHeartbeats.delete(req.params.deviceId)
       return res.json({ ok: true })
     }
     const rows = await prisma.$queryRaw`
       UPDATE kds.device_sessions
       SET
         is_active = COALESCE(${typeof isActive === 'boolean' ? isActive : null}, is_active),
+        revoked_at = CASE
+          WHEN ${shouldRevoke} THEN COALESCE(revoked_at, now())
+          ELSE revoked_at
+        END,
+        revoked_by = CASE
+          WHEN ${shouldRevoke} THEN COALESCE(${revokedBy}::uuid, revoked_by)
+          ELSE revoked_by
+        END,
+        revocation_reason = CASE
+          WHEN ${shouldRevoke} THEN COALESCE(${req.body.revocation_reason || req.body.reason || 'removed_from_dashboard'}, revocation_reason)
+          ELSE revocation_reason
+        END,
         device_name = CASE
           WHEN ${Object.prototype.hasOwnProperty.call(req.body, 'device_name')} THEN ${String(req.body.device_name || '').trim()}
           ELSE device_name
@@ -2252,6 +3329,7 @@ app.patch('/api/:slug/admin/devices/:deviceId', async (req, res) => {
       RETURNING device_id::text
     `
     if (!rows[0]) return res.status(404).json({ error: 'Device not found' })
+    if (shouldRevoke) _kdsHeartbeats.delete(req.params.deviceId)
     return res.json({ ok: true })
   } catch (err) {
     console.error('[devices PATCH]', err.message)

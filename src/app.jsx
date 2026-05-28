@@ -15,7 +15,7 @@ import DevicesScreen  from './screens/devices.jsx'
 import StaffScreen    from './screens/staff.jsx'
 import MembersScreen  from './screens/members.jsx'
 import GiftCardsScreen from './screens/gift-cards.jsx'
-import ConversationsScreen from './screens/conversations.jsx'
+import CustomersScreen from './screens/customers.jsx'
 import HoursScreen    from './screens/hours.jsx'
 import SettingsScreen from './screens/settings.jsx'
 import ProductsBillingScreen from './screens/products-billing.jsx'
@@ -55,7 +55,8 @@ function DashboardLayout() {
   const tenantName = tenantState?.selectedTenant?.name || tenant?.name
   const connection = useKdsConnection()
 
-  const screen = location.pathname.split('/').filter(Boolean)[0] || 'overview'
+  const rawScreen = location.pathname.split('/').filter(Boolean)[0] || 'overview'
+  const screen = rawScreen === 'conversations' || rawScreen === 'insights' ? 'customers' : rawScreen
 
   useEffect(() => {
     if (tenant?.primaryColor) document.documentElement.style.setProperty('--tenant-brand', tenant.primaryColor)
@@ -106,9 +107,11 @@ function DashboardLayout() {
             <Route path="orders"   element={<GuardedScreen moduleKey="orders" moduleName="Pedidos" product="KDS"><OrdersScreen/></GuardedScreen>}/>
             <Route path="devices"  element={<GuardedScreen moduleKey="devices" moduleName="Devices" product="KDS"><DevicesScreen/></GuardedScreen>}/>
             <Route path="staff"    element={<StaffScreen/>}/>
-            <Route path="members"  element={<GuardedScreen moduleKey="members" moduleName="Miembros" product="Umi Cash"><MembersScreen/></GuardedScreen>}/>
+            <Route path="customers/*" element={<GuardedScreen moduleKey="customers" moduleName="Customers" product="Dashboard"><CustomersScreen/></GuardedScreen>}/>
+            <Route path="members"  element={<GuardedScreen moduleKey="members" moduleName="Loyalty" product="Umi Cash"><MembersScreen/></GuardedScreen>}/>
             <Route path="gift-cards" element={<GuardedScreen moduleKey="gift-cards" moduleName="Gift Cards" product="Umi Cash"><GiftCardsScreen/></GuardedScreen>}/>
-            <Route path="conversations" element={<GuardedScreen moduleKey="conversations" moduleName="Conversaciones" product="ConversaFlow"><ConversationsScreen/></GuardedScreen>}/>
+            <Route path="insights" element={<Navigate to="/customers" replace/>}/>
+            <Route path="conversations/*" element={<Navigate to="/customers?filter=whatsapp" replace/>}/>
             <Route path="hours"    element={<GuardedScreen moduleKey="hours" moduleName="Hours" product="ConversaFlow"><HoursScreen ordersPaused={ordersPaused} setOrdersPaused={setOrdersPaused}/></GuardedScreen>}/>
             <Route path="settings" element={<SettingsScreen/>}/>
             <Route path="products-billing" element={<ProductsBillingScreen/>}/>

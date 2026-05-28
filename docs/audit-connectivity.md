@@ -71,6 +71,7 @@ Admin API routes available at `/api/[slug]/admin/`:
 | **Settings** | `umi_cash.Tenant` via Express | Full read/write |
 | **Staff** | `conversaflow.staff_members` via Express | Operational roster now lives by business tenant in ConversaFlow. Existing Cash staff rows are compatibility/auth data only. |
 | **Members** | `umi_cash.User + LoyaltyCard` via Express | Pagination, search, sort |
+| **Customers** | `platform.contacts` via tenant API, legacy phone fallback when needed | Customer 360 list/profile with WhatsApp, orders, loyalty, notes, and identity/data tabs |
 | **Hours** | `conversaflow.businesses.open_times` via Express raw SQL | Read/write, real KalalaCAFÉ hours |
 | **Overview** — loyalty KPIs | `umi_cash` analytics via Express | Real data |
 
@@ -91,7 +92,22 @@ Admin API routes available at `/api/[slug]/admin/`:
 | **Ticket detail** | Added slide-out detail from `kds.ticket_items`. |
 | **Device provisioning** | Added Express provisioning route that creates `kds.device_sessions` and returns one-time token. |
 | **Order status actions** | Added Express proxy to `kds-command` edge function. |
-| **Conversations screen** | Added screen backed by `conversaflow.conversations`, `customers`, and `messages`. |
+| **Conversations screen** | Retired as primary navigation; legacy route redirects into Customers WhatsApp filter. |
+
+### 2026-05-26 customer platform update
+
+- Primary navigation now uses `Customers`; legacy `/conversations/*` redirects to `/customers?filter=whatsapp`.
+- Legacy `/insights` redirects to `Customers`; customer signal counts remain inside the Customers screen.
+- Tenant-first customer routes are implemented:
+  - `GET /api/tenants/:tenantId/customers`
+  - `GET /api/tenants/:tenantId/customers/:contactId`
+  - `GET /api/tenants/:tenantId/customers/:contactId/timeline`
+  - `GET /api/tenants/:tenantId/customers/:contactId/conversations`
+  - `GET /api/tenants/:tenantId/customers/:contactId/orders`
+  - `GET /api/tenants/:tenantId/customers/:contactId/cash`
+  - `GET /api/tenants/:tenantId/customers/:contactId/identity`
+  - `GET /api/tenants/:tenantId/insights/customer-platform`
+- Owner Dashboard does not expose raw traces, tool-call payloads, embedding vectors, or service-role diagnostics.
 
 ---
 

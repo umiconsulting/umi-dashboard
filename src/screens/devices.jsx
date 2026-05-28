@@ -5,6 +5,7 @@ import {
   approveDevicePairing,
   denyDevicePairing,
   generateDevicePairingPin,
+  revokeDevice,
   updateDevice,
   useDevicePairings,
   useDevicesData,
@@ -13,10 +14,12 @@ import {
 
 // Screen 3 — Devices (KDS)
 // Data: useDevicesData() → kds.device_sessions from Supabase
-// Status derived from last_used_at: <10s=live, <65s=slow, else=offline
+// Status derived from local heartbeat: <10s=live, <20s=slow, else=offline.
 
 
 const STATIONS = ['HOT LINE', 'COLD LINE', 'PASTRY', 'BAR', 'PASS', 'OVEN'];
+const DEVICE_LIVE_MS = 10_000;
+const DEVICE_OFFLINE_MS = 20_000;
 
 // Derive human-readable last-seen from last_used_at timestamp
 function fmtLastSeen(lastUsedAt) {
@@ -31,8 +34,8 @@ function fmtLastSeen(lastUsedAt) {
 function deriveStatus(lastUsedAt) {
   if (!lastUsedAt) return 'offline';
   var ms = Date.now() - new Date(lastUsedAt).getTime();
-  if (ms < 10000) return 'live';
-  if (ms < 65000) return 'slow';
+  if (ms < DEVICE_LIVE_MS) return 'live';
+  if (ms < DEVICE_OFFLINE_MS) return 'slow';
   return 'offline';
 }
 
@@ -45,8 +48,7 @@ const DevicesScreen = () => {
   const [editDevice,  setEditDevice]  = useState(null);
   const [countdown,   setCountdown]   = useState(POLL_INTERVAL);
 
-  // Auto-poll: refresh device data every POLL_INTERVAL seconds so offline→online
-  // transitions are picked up automatically (KDS heartbeats update last_used_at).
+  // Auto-poll local heartbeat data so offline/online transitions are picked up.
   useEffect(function() {
     setCountdown(POLL_INTERVAL);
     const pollId = setInterval(function() {
@@ -188,10 +190,10 @@ const DevicesScreen = () => {
       <div className="card fade-up d3" style={{padding:'18px 22px', display:'flex', gap:24, alignItems:'center', flexWrap:'wrap'}}>
         <div className="eyebrow">Connection legend</div>
         <span className="legend"><span className="s-dot live"/> Live · responding under 10 s</span>
-        <span className="legend"><span className="s-dot slow"/> Slow · responding 10–65 s</span>
-        <span className="legend"><span className="s-dot offline"/> Offline · no heartbeat 65 s+</span>
+        <span className="legend"><span className="s-dot slow"/> Slow · responding 10–20 s</span>
+        <span className="legend"><span className="s-dot offline"/> Offline · no heartbeat 20 s+</span>
         <span style={{marginLeft:'auto', fontSize:12.5, color:'var(--ink-3)'}}>
-          Source · <span style={{fontFamily:'var(--font-mono)'}}>kds.device_sessions</span> · last_used_at
+          Source · <span style={{fontFamily:'var(--font-mono)'}}>local heartbeat</span> + <span style={{fontFamily:'var(--font-mono)'}}>kds.device_sessions</span>
         </span>
       </div>
 
@@ -322,6 +324,7 @@ const EditDevicePanel = ({ device, stations, onClose, onSaved }) => {
   const [reveal,   setReveal]   = useState(false);
   const [saving,   setSaving]   = useState(false);
   const [removing, setRemoving] = useState(false);
+  const [confirmingRevoke, setConfirmingRevoke] = useState(false);
   const [error,    setError]    = useState(null);
 
   async function save() {
@@ -340,7 +343,7 @@ const EditDevicePanel = ({ device, stations, onClose, onSaved }) => {
     setRemoving(true);
     setError(null);
     try {
-      await updateDevice(device.id, { is_active: false });
+      await revokeDevice(device.id, 'removed_from_dashboard');
       onSaved && onSaved();
     } catch (err) {
       setError(err.message);
@@ -357,7 +360,7 @@ const EditDevicePanel = ({ device, stations, onClose, onSaved }) => {
         <div className="sheet-head">
           <div>
             <div className="eyebrow">KDS · Dispositivo</div>
-            <h2 className="h-section" style={{marginTop:4}}>Editar dispositivo</h2>
+            <h2 className="h-section" style={{marginTop:4}}>Gestionar dispositivo</h2>
           </div>
           <button className="btn-icon" onClick={onClose} aria-label="Cerrar"><I.X size={16}/></button>
         </div>
@@ -421,9 +424,9 @@ const EditDevicePanel = ({ device, stations, onClose, onSaved }) => {
               className="btn btn-ghost btn-sm focusable"
               style={{color:'var(--danger)'}}
               disabled={removing}
-              onClick={remove}
+              onClick={() => setConfirmingRevoke(true)}
             >
-              <I.Trash size={14}/> {removing ? 'Eliminando…' : 'Eliminar dispositivo'}
+              <I.Trash size={14}/> {removing ? 'Revocando…' : 'Revocar dispositivo'}
             </button>
           </div>
         </div>
@@ -439,6 +442,36 @@ const EditDevicePanel = ({ device, stations, onClose, onSaved }) => {
           </button>
         </div>
       </aside>
+      {confirmingRevoke && (
+        <>
+          <div className="sheet-backdrop" onClick={() => !removing && setConfirmingRevoke(false)}/>
+          <aside className="sheet" style={{maxWidth:420}}>
+            <div className="sheet-head">
+              <div>
+                <div className="eyebrow">KDS · Acceso</div>
+                <h2 className="h-section" style={{marginTop:4}}>Revocar dispositivo</h2>
+              </div>
+              <button className="btn-icon" disabled={removing} onClick={() => setConfirmingRevoke(false)} aria-label="Cerrar"><I.X size={16}/></button>
+            </div>
+            <div className="sheet-body">
+              <p style={{margin:0, color:'var(--ink-2)', fontSize:14.5, lineHeight:1.5}}>
+                Este iPad se cerrará y tendrá que parearse de nuevo con un PIN.
+              </p>
+              {error && (
+                <div style={{fontSize:12.5, color:'var(--danger)', background:'var(--danger-soft)', borderRadius:10, padding:'9px 12px'}}>
+                  {error}
+                </div>
+              )}
+            </div>
+            <div className="sheet-foot">
+              <button className="btn btn-ghost" disabled={removing} onClick={() => setConfirmingRevoke(false)}>Cancelar</button>
+              <button className="btn btn-primary focusable" disabled={removing} onClick={remove}>
+                {removing ? 'Revocando…' : 'Revocar'}
+              </button>
+            </div>
+          </aside>
+        </>
+      )}
     </>
   );
 };

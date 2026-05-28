@@ -13,10 +13,15 @@ const EMPTY_PAIRINGS = []
 const EMPTY_TENANT = null
 const EMPTY_ORDERS = []
 const EMPTY_MEMBERS = { customers: [], total: 0, page: 1, totalPages: 1 }
+const EMPTY_CUSTOMERS = { customers: [], total: 0, page: 1, totalPages: 1, source: null }
+const EMPTY_CUSTOMER_DETAIL = { customer: null, timeline: [], conversations: [], orders: [], cash: null, identity: null }
+const EMPTY_CUSTOMER_INSIGHTS = { metrics: {}, insights: [], source: null }
 const EMPTY_STAFF = { staff: [] }
 const EMPTY_HOURS = { hours: {}, timezone: null }
 const EMPTY_GIFT_CARDS = { giftCards: [], total: 0, page: 1, totalPages: 1 }
 const EMPTY_CONVERSATIONS = { conversations: [], total: 0, page: 1, totalPages: 1 }
+const DEVICE_LIVE_MS = 10_000
+const DEVICE_OFFLINE_MS = 20_000
 
 function _tenantId(ctx) {
   return ctx?.selectedTenantId || ctx?.capabilities?.tenant?.id
@@ -87,8 +92,8 @@ function _deps(ctx, extra) {
 function _deviceStatus(lastUsedAt) {
   if (!lastUsedAt) return 'offline'
   var ms = Date.now() - new Date(lastUsedAt).getTime()
-  if (ms < 10000) return 'live'
-  if (ms < 65000) return 'slow'
+  if (ms < DEVICE_LIVE_MS) return 'live'
+  if (ms < DEVICE_OFFLINE_MS) return 'slow'
   return 'offline'
 }
 
@@ -200,7 +205,7 @@ async function _loadDevices(ctx) {
     const hb = hbMap[d.device_id]
     return Object.assign({ model: 'iPad', ip: '-' }, d, hb ? {
       _heartbeat: hb,
-      _heartbeatStatus: hb.status,    // 'live' | 'offline'
+      _heartbeatStatus: hb.status,    // 'live' | 'slow' | 'offline'
       _heartbeatSeenMs: hb.lastSeen,
     } : {})
   })
@@ -275,6 +280,26 @@ async function _loadMembers(ctx, opts) {
   })
   if (opts.search) q.set('search', opts.search)
   return _apiFetch(_tenantPath(ctx, '/cash/customers?' + q))
+}
+
+async function _loadCustomers(ctx, opts) {
+  opts = opts || {}
+  const q = new URLSearchParams({
+    page: String(opts.page || 1),
+    limit: String(opts.limit || 20),
+  })
+  if (opts.search) q.set('search', opts.search)
+  if (opts.filter) q.set('filter', opts.filter)
+  return _apiFetch(_tenantPath(ctx, '/customers?' + q))
+}
+
+async function _loadCustomerDetail(ctx, customerId) {
+  if (!customerId) return EMPTY_CUSTOMER_DETAIL
+  return _apiFetch(_tenantPath(ctx, '/customers/' + encodeURIComponent(customerId)))
+}
+
+async function _loadCustomerInsights(ctx) {
+  return _apiFetch(_tenantPath(ctx, '/insights/customer-platform'))
 }
 
 async function _loadStaff(ctx) {
@@ -406,6 +431,17 @@ async function updateDevice(deviceId, patch) {
   })
 }
 
+async function revokeDevice(deviceId, reason) {
+  const tenantId = window.localStorage.getItem('umi-dashboard-selected-tenant')
+  const locationId = window.localStorage.getItem('umi-dashboard-selected-location')
+  if (!tenantId) throw new Error('No active tenant selected')
+  const path = `/api/tenants/${encodeURIComponent(tenantId)}/kds/devices/${encodeURIComponent(deviceId)}/revoke${locationId ? `?locationId=${encodeURIComponent(locationId)}` : ''}`
+  return _apiFetch(path, {
+    method: 'POST',
+    body: JSON.stringify({ reason: reason || 'removed_from_dashboard' }),
+  })
+}
+
 async function transitionOrder(ticketId, targetStatus, extra) {
   const tenantId = window.localStorage.getItem('umi-dashboard-selected-tenant')
   const locationId = window.localStorage.getItem('umi-dashboard-selected-location')
@@ -467,6 +503,30 @@ function useMembersData(opts) {
   }, _deps(ctx, [page, search, sort]), EMPTY_MEMBERS)
 }
 
+function useCustomersData(opts) {
+  const ctx = useTenant()
+  var page = opts && opts.page ? opts.page : 1
+  var search = opts && opts.search ? opts.search : ''
+  var filter = opts && opts.filter ? opts.filter : ''
+  return _useAsync(function() {
+    return _loadCustomers(ctx, { page: page, search: search, filter: filter })
+  }, _deps(ctx, [page, search, filter]), EMPTY_CUSTOMERS)
+}
+
+function useCustomerDetail(customerId, refresh) {
+  const ctx = useTenant()
+  return _useAsync(function() {
+    return _loadCustomerDetail(ctx, customerId)
+  }, _deps(ctx, [customerId || '', refresh || 0]), EMPTY_CUSTOMER_DETAIL)
+}
+
+function useCustomerInsights(refresh) {
+  const ctx = useTenant()
+  return _useAsync(function() {
+    return _loadCustomerInsights(ctx)
+  }, _deps(ctx, [refresh || 0]), EMPTY_CUSTOMER_INSIGHTS)
+}
+
 function useGiftCardsData(opts) {
   const ctx = useTenant()
   var page = opts && opts.page ? opts.page : 1
@@ -524,10 +584,11 @@ function useKdsConnection() {
 export {
   useOverviewData, useDevicesData, useTenantData, useOrdersData,
   useKdsStations, useDevicePairings,
-  useMembersData, useStaffData, useBusinessHours, useGiftCardsData, useConversationsData,
+  useMembersData, useCustomersData, useCustomerDetail, useCustomerInsights,
+  useStaffData, useBusinessHours, useGiftCardsData, useConversationsData,
   saveTenantSettings, saveRewardConfig, saveBusinessHours,
   createStaffMember, updateStaffMember, deleteStaffMember,
-  provisionDevice, generateDevicePairingPin, approveDevicePairing, denyDevicePairing, updateDevice, transitionOrder,
+  provisionDevice, generateDevicePairingPin, approveDevicePairing, denyDevicePairing, updateDevice, revokeDevice, transitionOrder,
   useKdsConnection,
   _LIVE as DATA_IS_LIVE,
 }
