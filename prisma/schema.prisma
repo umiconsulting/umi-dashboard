@@ -1,3 +1,8 @@
+// Umi Dashboard Prisma schema — maps to the dashboard_compat.* views of the platform
+// database (S4.1 cutover, 2026-06-10). This is no longer a copy of the umi-cash schema:
+// each model resolves to a view over platform/cash/conversaflow schemas, plus the two
+// dashboard_compat local-auth tables. Models the dashboard does not query were removed.
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -42,7 +47,6 @@ model Tenant {
   rewardConfigs   RewardConfig[]
   locations       Location[]
   giftCards       GiftCard[]
-  birthdayRewards BirthdayReward[]
 }
 
 model Location {
@@ -78,7 +82,6 @@ model User {
 
   tenant       Tenant      @relation(fields: [tenantId], references: [id])
   card         LoyaltyCard?
-  sessions     Session[]
   staffVisits  Visit[]     @relation("StaffVisits")
   staffTransactions Transaction[] @relation("StaffTransactions")
 
@@ -88,30 +91,7 @@ model User {
   @@index([tenantId, role])
 }
 
-model Session {
-  id        String   @id @default(cuid())
-  userId    String
-  token     String   @unique
-  expiresAt DateTime
-  createdAt DateTime @default(now())
 
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([token])
-}
-
-model OtpVerification {
-  id        String   @id @default(cuid())
-  phone     String
-  tenantId  String
-  codeHash  String
-  expiresAt DateTime
-  attempts  Int      @default(0)
-  verified  Boolean  @default(false)
-  createdAt DateTime @default(now())
-
-  @@index([phone, tenantId])
-}
 
 // ─── Loyalty Card ─────────────────────────────────────────────────────────────
 
@@ -153,9 +133,7 @@ model LoyaltyCard {
   visits              Visit[]
   transactions        Transaction[]
   rewardRedemptions   RewardRedemption[]
-  applePushTokens     ApplePushToken[]
   redeemedGiftCards   GiftCard[]
-  birthdayRewards     BirthdayReward[]
 
   @@index([tenantId])
 }
@@ -267,35 +245,6 @@ model GiftCard {
 
 // ─── Birthday Rewards ─────────────────────────────────────────────────────────
 
-model BirthdayReward {
-  id            String    @id @default(cuid())
-  tenantId      String
-  loyaltyCardId String
-  year          Int                        // calendar year, e.g. 2026
-  issuedAt      DateTime  @default(now())
-  expiresAt     DateTime                  // last day of birthday month at 23:59:59
-  redeemedAt    DateTime?
-  status        String    @default("ACTIVE") // ACTIVE | REDEEMED | EXPIRED
-
-  tenant      Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  loyaltyCard LoyaltyCard @relation(fields: [loyaltyCardId], references: [id], onDelete: Cascade)
-
-  @@unique([loyaltyCardId, tenantId, year])
-  @@index([tenantId])
-  @@index([loyaltyCardId])
-  @@index([expiresAt, status])
-}
 
 // ─── Apple Wallet Push ────────────────────────────────────────────────────────
 
-model ApplePushToken {
-  id          String   @id @default(cuid())
-  cardId      String
-  deviceToken String
-  pushToken   String
-  createdAt   DateTime @default(now())
-
-  card        LoyaltyCard @relation(fields: [cardId], references: [id], onDelete: Cascade)
-
-  @@unique([cardId, deviceToken])
-}

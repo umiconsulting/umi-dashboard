@@ -16,8 +16,11 @@ import nodemailer from 'nodemailer'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const prisma    = new PrismaClient()
 const app       = express()
-const PLATFORM_TRANSITION_SCHEMA = process.env.UMI_DASHBOARD_SCHEMA === 'platform_transition'
 const DEV_ORIGIN = `http://localhost:${process.env.VITE_DEV_PORT || '4000'}`
+const DEPLOYMENT_ORIGIN = process.env.DASHBOARD_ALLOWED_ORIGIN
+  || process.env.APP_URL
+  || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '')
+const ALLOWED_ORIGIN = DEPLOYMENT_ORIGIN || DEV_ORIGIN
 
 app.use(express.json())
 
@@ -48,7 +51,7 @@ function createMailTransport() {
 
 // CORS — allow the configured Vite dev server to call the API.
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin',  DEV_ORIGIN)
+  res.header('Access-Control-Allow-Origin',  ALLOWED_ORIGIN)
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS')
   res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-UMI-User-ID,X-KDS-Device-Token,apikey')
   if (req.method === 'OPTIONS') return res.sendStatus(204)
@@ -77,9 +80,7 @@ app.post('/api/kds/heartbeat', async (req, res) => {
   const { device_id, device_name, station_id, station_name } = req.body || {}
   if (!device_id) return res.status(400).json({ error: 'device_id required' })
   try {
-    const rows = PLATFORM_TRANSITION_SCHEMA
-      ? await prisma.$queryRaw`SELECT is_active FROM kds.device_sessions WHERE id = ${device_id}::uuid LIMIT 1`
-      : await prisma.$queryRaw`SELECT is_active FROM kds.device_sessions WHERE device_id = ${device_id}::uuid LIMIT 1`
+    const rows = await prisma.$queryRaw`SELECT is_active FROM kds.device_sessions WHERE id = ${device_id}::uuid LIMIT 1`
     if (rows[0] && rows[0].is_active !== true) return res.status(403).json(kdsRevokedPayload())
     if (!rows[0]) return res.status(404).json({ error: 'device_session_not_found' })
   } catch (err) {
@@ -114,10 +115,6 @@ app.get('/api/kds/heartbeats', (_req, res) => {
 })
 
 app.post('/api/auth/local/login', async (req, res) => {
-  if (!PLATFORM_TRANSITION_SCHEMA) {
-    return res.status(404).json({ error: 'Local auth is only enabled for the local transition profile' })
-  }
-
   const username = String(req.body.username || '').trim().toLowerCase()
   const password = String(req.body.password || '')
   if (!username || !password) return res.status(400).json({ error: 'username and password are required' })
@@ -178,9 +175,6 @@ app.post('/api/auth/local/login', async (req, res) => {
 })
 
 app.post('/api/auth/local/forgot-password', async (req, res) => {
-  if (!PLATFORM_TRANSITION_SCHEMA) {
-    return res.status(404).json({ error: 'Local auth is only enabled for the local transition profile' })
-  }
   const email = String(req.body.email || '').trim().toLowerCase()
   if (!email) return res.status(400).json({ error: 'email is required' })
 
@@ -233,9 +227,6 @@ app.post('/api/auth/local/forgot-password', async (req, res) => {
 })
 
 app.post('/api/auth/local/reset-password', async (req, res) => {
-  if (!PLATFORM_TRANSITION_SCHEMA) {
-    return res.status(404).json({ error: 'Local auth is only enabled for the local transition profile' })
-  }
   const token    = String(req.body.token    || '').trim()
   const password = String(req.body.password || '')
   if (!token || !password) return res.status(400).json({ error: 'token and password are required' })
@@ -289,28 +280,25 @@ async function getTenant(slug) {
 async function getTenantById(tenantId) {
   if (!tenantId) return null
   try {
-    if (PLATFORM_TRANSITION_SCHEMA) {
-      const rows = await prisma.$queryRaw`
-        SELECT id::text, slug, name, timezone
-        FROM platform.tenants
-        WHERE id = ${tenantId}::uuid
-        LIMIT 1
-      `
-      return rows[0] ? {
-        id: rows[0].id,
-        slug: rows[0].slug,
-        name: rows[0].name,
-        timezone: rows[0].timezone,
-      } : null
-    }
-    return prisma.tenant.findUnique({ where: { id: tenantId } })
+    const rows = await prisma.$queryRaw`
+      SELECT id::text, slug, name, timezone
+      FROM platform.tenants
+      WHERE id = ${tenantId}::uuid
+      LIMIT 1
+    `
+    return rows[0] ? {
+      id: rows[0].id,
+      slug: rows[0].slug,
+      name: rows[0].name,
+      timezone: rows[0].timezone,
+    } : null
   } catch {
     return null
   }
 }
 
 async function getLocationForTenant(tenantId, requestedLocationId = null) {
-  if (!PLATFORM_TRANSITION_SCHEMA || !tenantId) return null
+  if (!tenantId) return null
   const rows = requestedLocationId
     ? await prisma.$queryRaw`
         SELECT id::text, slug, name
@@ -337,31 +325,14 @@ async function getDashboardContext(slug, requestedLocationId = null) {
   const tenant = await getTenant(slug)
   if (!tenant) return null
 
-  if (PLATFORM_TRANSITION_SCHEMA) {
-    const location = await getLocationForTenant(tenant.id, requestedLocationId)
-    return {
-      tenant,
-      tenantId: tenant.id,
-      locationId: location?.id ?? null,
-      businessId: tenant.id,
-      cashTenantId: tenant.id,
-      cashSlug: tenant.slug,
-    }
-  }
-
-  const refs = await prisma.$queryRaw`
-    SELECT business_id::text AS "businessId", cash_tenant_id AS "cashTenantId", cash_slug AS "cashSlug"
-    FROM conversaflow.business_external_refs
-    WHERE cash_slug = ${tenant.slug}
-       OR cash_tenant_id = ${tenant.id}
-    LIMIT 1
-  `
-
+  const location = await getLocationForTenant(tenant.id, requestedLocationId)
   return {
     tenant,
-    businessId: refs[0]?.businessId ?? null,
-    cashTenantId: refs[0]?.cashTenantId ?? tenant.id,
-    cashSlug: refs[0]?.cashSlug ?? tenant.slug,
+    tenantId: tenant.id,
+    locationId: location?.id ?? null,
+    businessId: tenant.id,
+    cashTenantId: tenant.id,
+    cashSlug: tenant.slug,
   }
 }
 
@@ -508,7 +479,6 @@ async function requireProduct(req, res, tenantId, productKey) {
 }
 
 async function requireLegacyProduct(req, res, productKey) {
-  if (!PLATFORM_TRANSITION_SCHEMA) return true
   const rows = await prisma.$queryRaw`
     SELECT pi.status
     FROM platform.tenants AS t
@@ -1018,150 +988,6 @@ async function loadPlatformCustomerIdentity(capabilities, contactId) {
   }
 }
 
-function mergeLegacyCustomer(map, partial) {
-  const key = partial.normalizedPhone || partial.id
-  const existing = map.get(key) || {
-    id: key.startsWith('+') ? `phone:${key}` : key,
-    displayName: partial.displayName || 'Unknown customer',
-    phone: partial.phone || '',
-    normalizedPhone: partial.normalizedPhone || null,
-    email: partial.email || '',
-    createdAt: partial.createdAt || null,
-    lastTouchAt: partial.lastTouchAt || partial.createdAt || null,
-    products: {
-      whatsapp: { available: false, active: false, source: 'none' },
-      cash: { available: false, active: false, source: 'none' },
-      orders: { available: false, active: false, source: 'none' },
-      giftCards: { available: false, active: false, source: 'none' },
-    },
-    value: { orders: 0, totalSpendCents: 0, totalSpend: centsToMoney(0), visits: 0, walletBalanceCents: 0, walletBalance: centsToMoney(0) },
-    memory: { factsCount: 0, embeddingHealth: 'fallback', summary: 'Legacy phone match fallback' },
-    dataQuality: { mergeCandidates: 0, findings: 0, needsReview: false },
-    identities: [],
-    sourceRefs: [],
-  }
-  const lastTouchAt = [existing.lastTouchAt, partial.lastTouchAt].filter(Boolean).sort().at(-1) || existing.lastTouchAt
-  existing.displayName = existing.displayName === 'Unknown customer' ? (partial.displayName || existing.displayName) : existing.displayName
-  existing.phone = existing.phone || partial.phone || ''
-  existing.email = existing.email || partial.email || ''
-  existing.lastTouchAt = lastTouchAt
-  existing.createdAt = existing.createdAt || partial.createdAt || null
-  existing.sourceRefs.push(partial.sourceRef)
-  if (partial.cash) {
-    existing.products.cash = { available: true, active: true, source: 'cash' }
-    existing.products.giftCards.available = true
-    existing.value.visits += partial.cash.totalVisits || 0
-    existing.value.walletBalanceCents += partial.cash.walletBalanceCents || 0
-    existing.value.walletBalance = centsToMoney(existing.value.walletBalanceCents)
-  }
-  if (partial.whatsapp) {
-    existing.products.whatsapp = { available: true, active: true, source: 'conversaflow' }
-    existing.products.whatsapp.conversations = (existing.products.whatsapp.conversations || 0) + (partial.whatsapp.conversations || 0)
-    existing.products.whatsapp.activeConversations = partial.whatsapp.activeConversations || 0
-    existing.value.orders += partial.whatsapp.outcomes || 0
-    existing.memory.factsCount += partial.whatsapp.factsCount || 0
-    existing.memory.summary = existing.memory.factsCount > 0 ? `${existing.memory.factsCount} extracted fact group${existing.memory.factsCount === 1 ? '' : 's'}` : existing.memory.summary
-  }
-  existing.status = existing.products.whatsapp.active || existing.products.cash.active ? 'active' : 'new'
-  map.set(key, existing)
-}
-
-async function loadLegacyCustomers(capabilities, options = {}) {
-  const page = Math.max(1, parseInt(options.page || '1') || 1)
-  const limit = Math.max(1, Math.min(parseInt(options.limit || '20') || 20, 100))
-  const search = String(options.search || '').trim().slice(0, 80).toLowerCase()
-  const filter = String(options.filter || '').trim().slice(0, 24)
-  const ctx = await getDashboardContext(capabilities.tenant.slug, null)
-  const map = new Map()
-
-  if (productAvailable(capabilities, 'cash')) {
-    const users = await prisma.user.findMany({
-      where: { tenantId: ctx.cashTenantId, role: 'CUSTOMER' },
-      include: { card: { include: { visits: { orderBy: { scannedAt: 'desc' }, take: 1 } } } },
-      orderBy: { createdAt: 'desc' },
-      take: 500,
-    })
-    users.forEach((user) => mergeLegacyCustomer(map, {
-      id: `cash:${user.id}`,
-      displayName: user.name,
-      phone: user.phone,
-      normalizedPhone: normalizeCustomerPhone(user.phone),
-      email: user.email,
-      createdAt: iso(user.createdAt),
-      lastTouchAt: iso(user.card?.visits?.[0]?.scannedAt || user.updatedAt),
-      cash: {
-        totalVisits: user.card?.totalVisits || 0,
-        walletBalanceCents: user.card?.balanceCentavos || 0,
-      },
-      sourceRef: { product: 'cash', id: user.id },
-    }))
-  }
-
-  if (productAvailable(capabilities, 'conversaflow') && ctx.businessId) {
-    const rows = await prisma.$queryRaw`
-      SELECT
-        c.id::text,
-        c.name,
-        c.phone,
-        c.created_at,
-        count(DISTINCT cv.id)::int AS conversation_count,
-        count(DISTINCT co.id)::int AS outcome_count,
-        count(DISTINCT cp.customer_id)::int AS facts_count,
-        max(COALESCE(cv.last_message_at, cv.created_at, c.created_at)) AS last_touch_at
-      FROM conversaflow.customers AS c
-      LEFT JOIN conversaflow.conversations AS cv ON cv.customer_id = c.id
-      LEFT JOIN conversaflow.conversation_outcomes AS co ON co.customer_id = c.id
-      LEFT JOIN conversaflow.customer_preferences AS cp ON cp.customer_id = c.id AND cp.facts <> '{}'::jsonb
-      WHERE c.business_id = ${ctx.businessId}::uuid
-      GROUP BY c.id
-      ORDER BY max(COALESCE(cv.last_message_at, cv.created_at, c.created_at)) DESC NULLS LAST
-      LIMIT 500
-    `
-    rows.forEach((row) => mergeLegacyCustomer(map, {
-      id: `conversaflow:${row.id}`,
-      displayName: row.name,
-      phone: row.phone,
-      normalizedPhone: normalizeCustomerPhone(row.phone),
-      createdAt: iso(row.created_at),
-      lastTouchAt: iso(row.last_touch_at),
-      whatsapp: {
-        conversations: Number(row.conversation_count || 0),
-        outcomes: Number(row.outcome_count || 0),
-        factsCount: Number(row.facts_count || 0),
-      },
-      sourceRef: { product: 'conversaflow', id: row.id },
-    }))
-  }
-
-  let rows = Array.from(map.values())
-  rows.forEach((row) => {
-    row.products.cash.available = productAvailable(capabilities, 'cash')
-    row.products.giftCards.available = productAvailable(capabilities, 'cash')
-    row.products.whatsapp.available = productAvailable(capabilities, 'conversaflow')
-    row.products.orders.available = productAvailable(capabilities, 'kds') || productAvailable(capabilities, 'conversaflow')
-  })
-  if (search) {
-    rows = rows.filter((row) => [
-      row.displayName,
-      row.phone,
-      row.normalizedPhone,
-      row.email,
-    ].some((value) => String(value || '').toLowerCase().includes(search)))
-  }
-  if (filter) {
-    rows = rows.filter((row) => {
-      if (filter === 'whatsapp') return row.products.whatsapp.active
-      if (filter === 'cash') return row.products.cash.active
-      if (filter === 'memory') return row.memory.factsCount > 0
-      if (filter === 'review') return row.dataQuality.needsReview
-      return true
-    })
-  }
-  rows.sort((a, b) => String(b.lastTouchAt || '').localeCompare(String(a.lastTouchAt || '')))
-  const total = rows.length
-  const start = (page - 1) * limit
-  return { customers: rows.slice(start, start + limit), total, page, totalPages: Math.max(1, Math.ceil(total / limit)), source: 'legacy-phone-fallback' }
-}
 
 async function callKdsPairingBackend(action, body) {
   const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
@@ -1249,19 +1075,11 @@ async function verifyLocalKdsDevice(req) {
   }
 
   const deviceId = String(row.id || row.device_id)
-  if (PLATFORM_TRANSITION_SCHEMA) {
-    await prisma.$executeRaw`
-      UPDATE kds.device_sessions
-      SET last_seen_at = now()
-      WHERE id = ${deviceId}::uuid
-    `
-  } else {
-    await prisma.$executeRaw`
-      UPDATE kds.device_sessions
-      SET last_used_at = now()
-      WHERE device_id = ${deviceId}::uuid
-    `
-  }
+  await prisma.$executeRaw`
+    UPDATE kds.device_sessions
+    SET last_seen_at = now()
+    WHERE id = ${deviceId}::uuid
+  `
 
   return {
     deviceId,
@@ -1513,7 +1331,7 @@ app.post('/api/kds/board', async (req, res) => {
       return res.json({ ok: true, data: [] })
     }
 
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       const rows = await prisma.$queryRaw`
         SELECT
           t.id::text AS ticket_id,
@@ -1564,12 +1382,6 @@ app.post('/api/kds/board', async (req, res) => {
       `
       return res.json({ ok: true, data: rows })
     }
-
-    const rows = await prisma.$queryRaw`
-      SELECT *
-      FROM kds.get_board_snapshot(${device.businessId}::uuid, ${device.stationId})
-    `
-    return res.json({ ok: true, data: rows })
   } catch (err) {
     console.error('[kds board local]', err.message)
     return res.status(err.status || 500).json(err.payload || { error: err.message })
@@ -1590,30 +1402,17 @@ app.post('/api/kds/command', async (req, res) => {
         return res.status(400).json({ error: 'missing_required_fields' })
       }
 
-      if (PLATFORM_TRANSITION_SCHEMA) {
-        const rows = await prisma.$queryRaw`
-          UPDATE kds.tickets
-          SET status = ${targetStatus}, updated_at = now()
-          WHERE id = ${ticketId}::uuid
-            AND tenant_id = ${device.tenantId}::uuid
-            AND (${device.locationId}::uuid IS NULL OR location_id IS NOT DISTINCT FROM ${device.locationId}::uuid)
-            AND (${device.stationId}::uuid IS NULL OR station_id IS NOT DISTINCT FROM ${device.stationId}::uuid OR station_id IS NULL)
-          RETURNING id::text AS ticket_id, status
-        `
-        if (!rows[0]) return res.status(404).json({ error: 'Ticket not found' })
-        return res.json({ ok: true, data: rows[0] })
-      }
-
       const rows = await prisma.$queryRaw`
-        SELECT kds.transition_ticket(
-          ${ticketId}::uuid,
-          ${targetStatus}::kds.ticket_status,
-          'kds_app',
-          ${device.deviceId},
-          ${device.stationId}
-        ) AS data
+        UPDATE kds.tickets
+        SET status = ${targetStatus}, updated_at = now()
+        WHERE id = ${ticketId}::uuid
+          AND tenant_id = ${device.tenantId}::uuid
+          AND (${device.locationId}::uuid IS NULL OR location_id IS NOT DISTINCT FROM ${device.locationId}::uuid)
+          AND (${device.stationId}::uuid IS NULL OR station_id IS NOT DISTINCT FROM ${device.stationId}::uuid OR station_id IS NULL)
+        RETURNING id::text AS ticket_id, status
       `
-      return res.json({ ok: true, data: rows[0]?.data ?? null })
+      if (!rows[0]) return res.status(404).json({ error: 'Ticket not found' })
+      return res.json({ ok: true, data: rows[0] })
     }
 
     if (action === 'partial_cancel_items') {
@@ -1621,7 +1420,7 @@ app.post('/api/kds/command', async (req, res) => {
       const itemIds = Array.isArray(req.body.item_ids) ? req.body.item_ids : []
       if (!ticketId || itemIds.length === 0) return res.status(400).json({ error: 'missing_required_fields' })
 
-      if (PLATFORM_TRANSITION_SCHEMA) {
+      {
         const [, rows] = await prisma.$transaction([
           prisma.$executeRaw`
             UPDATE kds.ticket_items
@@ -1650,8 +1449,6 @@ app.post('/api/kds/command', async (req, res) => {
         if (!rows[0]) return res.status(404).json({ error: 'Ticket not found' })
         return res.json({ ok: true, data: rows[0] })
       }
-
-      return res.status(409).json({ error: 'partial_cancel_items is not implemented in local legacy mode' })
     }
 
     return res.status(400).json({ error: 'unknown_action' })
@@ -1786,9 +1583,7 @@ app.get('/api/tenants/:tenantId/customers', async (req, res) => {
   try {
     const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
     if (!capabilities) return null
-    const payload = PLATFORM_TRANSITION_SCHEMA
-      ? await loadPlatformCustomers(capabilities, req.query)
-      : await loadLegacyCustomers(capabilities, req.query)
+    const payload = await loadPlatformCustomers(capabilities, req.query)
     return res.json(payload)
   } catch (err) {
     console.error('[tenant customers GET]', err.message)
@@ -1800,29 +1595,6 @@ app.get('/api/tenants/:tenantId/customers/:contactId', async (req, res) => {
   try {
     const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
     if (!capabilities) return null
-    if (!PLATFORM_TRANSITION_SCHEMA) {
-      const payload = await loadLegacyCustomers(capabilities, { page: 1, limit: 500 })
-      const customer = payload.customers.find((row) => row.id === req.params.contactId)
-      if (!customer) return res.status(404).json({ error: 'customer_not_found' })
-      return res.json({
-        customer,
-        timeline: [],
-        conversations: [],
-        orders: [],
-        cash: { available: productAvailable(capabilities, 'cash'), source: 'legacy-phone-fallback', account: null },
-        identity: {
-          identities: customer.normalizedPhone ? [{
-            identity_type: 'phone',
-            identity_value: customer.phone,
-            normalized_value: customer.normalizedPhone,
-            verification_status: 'unverified',
-            confidence: 'candidate',
-          }] : [],
-          mergeCandidates: [],
-          findings: [],
-        },
-      })
-    }
     const detail = await loadPlatformCustomerDetail(capabilities, req.params.contactId)
     if (!detail) return res.status(404).json({ error: 'customer_not_found' })
     return res.json(detail)
@@ -1836,9 +1608,7 @@ app.get('/api/tenants/:tenantId/customers/:contactId/timeline', async (req, res)
   try {
     const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
     if (!capabilities) return null
-    const timeline = PLATFORM_TRANSITION_SCHEMA
-      ? await loadPlatformCustomerTimeline(capabilities, req.params.contactId)
-      : []
+    const timeline = await loadPlatformCustomerTimeline(capabilities, req.params.contactId)
     return res.json({ timeline })
   } catch (err) {
     console.error('[tenant customer timeline GET]', err.message)
@@ -1850,9 +1620,7 @@ app.get('/api/tenants/:tenantId/customers/:contactId/conversations', async (req,
   try {
     const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
     if (!capabilities) return null
-    const conversations = PLATFORM_TRANSITION_SCHEMA
-      ? await loadPlatformCustomerConversations(capabilities, req.params.contactId)
-      : []
+    const conversations = await loadPlatformCustomerConversations(capabilities, req.params.contactId)
     return res.json({ conversations })
   } catch (err) {
     console.error('[tenant customer conversations GET]', err.message)
@@ -1864,9 +1632,7 @@ app.get('/api/tenants/:tenantId/customers/:contactId/orders', async (req, res) =
   try {
     const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
     if (!capabilities) return null
-    const orders = PLATFORM_TRANSITION_SCHEMA
-      ? await loadPlatformCustomerOrders(capabilities, req.params.contactId)
-      : []
+    const orders = await loadPlatformCustomerOrders(capabilities, req.params.contactId)
     return res.json({ orders })
   } catch (err) {
     console.error('[tenant customer orders GET]', err.message)
@@ -1878,9 +1644,7 @@ app.get('/api/tenants/:tenantId/customers/:contactId/cash', async (req, res) => 
   try {
     const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
     if (!capabilities) return null
-    const cash = PLATFORM_TRANSITION_SCHEMA
-      ? await loadPlatformCustomerCash(capabilities, req.params.contactId)
-      : { available: productAvailable(capabilities, 'cash'), source: 'legacy-phone-fallback', account: null }
+    const cash = await loadPlatformCustomerCash(capabilities, req.params.contactId)
     return res.json(cash)
   } catch (err) {
     console.error('[tenant customer cash GET]', err.message)
@@ -1892,9 +1656,7 @@ app.get('/api/tenants/:tenantId/customers/:contactId/identity', async (req, res)
   try {
     const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
     if (!capabilities) return null
-    const identity = PLATFORM_TRANSITION_SCHEMA
-      ? await loadPlatformCustomerIdentity(capabilities, req.params.contactId)
-      : { identities: [], mergeCandidates: [], findings: [] }
+    const identity = await loadPlatformCustomerIdentity(capabilities, req.params.contactId)
     return res.json(identity)
   } catch (err) {
     console.error('[tenant customer identity GET]', err.message)
@@ -1906,9 +1668,7 @@ app.get('/api/tenants/:tenantId/insights/customer-platform', async (req, res) =>
   try {
     const capabilities = await requireProduct(req, res, req.params.tenantId, 'dashboard')
     if (!capabilities) return null
-    const customersPayload = PLATFORM_TRANSITION_SCHEMA
-      ? await loadPlatformCustomers(capabilities, { page: 1, limit: 100 })
-      : await loadLegacyCustomers(capabilities, { page: 1, limit: 500 })
+    const customersPayload = await loadPlatformCustomers(capabilities, { page: 1, limit: 100 })
     const customers = customersPayload.customers || []
     const whatsappCustomers = customers.filter((customer) => customer.products?.whatsapp?.active).length
     const cashCustomers = customers.filter((customer) => customer.products?.cash?.active).length
@@ -2109,7 +1869,7 @@ app.patch('/api/:slug/admin/settings', async (req, res) => {
     const tenant = await getTenant(req.params.slug)
     if (!tenant) return notFound(res)
     const d = req.body
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       if (d.name !== undefined) {
         await prisma.$executeRaw`
           UPDATE platform.tenants
@@ -2157,26 +1917,6 @@ app.patch('/api/:slug/admin/settings', async (req, res) => {
       }
       return res.json({ ok: true })
     }
-    await prisma.tenant.update({
-      where: { id: tenant.id },
-      data: {
-        ...(d.name                  !== undefined && { name: d.name }),
-        ...(d.city                  !== undefined && { city: d.city }),
-        ...(d.primaryColor          !== undefined && { primaryColor: d.primaryColor }),
-        ...(d.secondaryColor        !== undefined && { secondaryColor: d.secondaryColor || null }),
-        ...(d.logoUrl               !== undefined && { logoUrl: d.logoUrl || null }),
-        ...(d.stripImageUrl         !== undefined && { stripImageUrl: d.stripImageUrl || null }),
-        ...(d.passStyle             !== undefined && { passStyle: d.passStyle }),
-        ...(d.promoMessage          !== undefined && { promoMessage: d.promoMessage || null }),
-        ...(d.promoStartsAt         !== undefined && { promoStartsAt: d.promoStartsAt ? new Date(d.promoStartsAt) : null }),
-        ...(d.promoEndsAt           !== undefined && { promoEndsAt:   d.promoEndsAt   ? new Date(d.promoEndsAt)   : null }),
-        ...(d.promoDays             !== undefined && { promoDays: d.promoDays || null }),
-        ...(d.selfRegistration      !== undefined && { selfRegistration: d.selfRegistration }),
-        ...(d.birthdayRewardEnabled !== undefined && { birthdayRewardEnabled: d.birthdayRewardEnabled }),
-        ...(d.birthdayRewardName    !== undefined && { birthdayRewardName: d.birthdayRewardName }),
-      },
-    })
-    return res.json({ ok: true })
   } catch (err) {
     return res.status(500).json({ error: err.message })
   }
@@ -2441,7 +2181,7 @@ app.get('/api/:slug/admin/staff', async (req, res) => {
     if (!ctx) return notFound(res)
     if (!ctx.businessId) return businessNotLinked(res)
 
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       const rows = await prisma.$queryRaw`
         SELECT
           id::text,
@@ -2464,28 +2204,6 @@ app.get('/api/:slug/admin/staff', async (req, res) => {
       `
       return res.json({ staff: rows.map(staffDto) })
     }
-
-    const rows = await prisma.$queryRaw`
-      SELECT
-        id::text,
-        name,
-        phone,
-        email,
-        role,
-        status,
-        permissions,
-        invited_at AS "invitedAt",
-        disabled_at AS "disabledAt",
-        created_at AS "createdAt",
-        updated_at AS "updatedAt"
-      FROM conversaflow.staff_members
-      WHERE business_id = ${ctx.businessId}::uuid
-      ORDER BY
-        CASE role WHEN 'ADMIN' THEN 0 ELSE 1 END,
-        CASE status WHEN 'active' THEN 0 WHEN 'invited' THEN 1 ELSE 2 END,
-        created_at ASC
-    `
-    return res.json({ staff: rows.map(staffDto) })
   } catch (err) {
     return res.status(500).json({ error: err.message })
   }
@@ -2509,7 +2227,7 @@ app.post('/api/:slug/admin/staff', async (req, res) => {
     if (!name) return res.status(400).json({ error: 'name is required' })
     if (!phone && !email) return res.status(400).json({ error: 'phone or email is required' })
 
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       const rows = await prisma.$queryRaw`
         INSERT INTO platform.staff_members (
           tenant_id,
@@ -2542,44 +2260,6 @@ app.post('/api/:slug/admin/staff', async (req, res) => {
       `
       return res.status(201).json({ staff: staffDto(rows[0]) })
     }
-
-    const rows = await prisma.$queryRaw`
-      INSERT INTO conversaflow.staff_members (
-        business_id,
-        name,
-        phone,
-        email,
-        role,
-        status,
-        permissions,
-        source_system,
-        invited_at
-      )
-      VALUES (
-        ${ctx.businessId}::uuid,
-        ${name},
-        ${phone},
-        ${email},
-        ${role},
-        ${status},
-        ${JSON.stringify(permissions)}::jsonb,
-        'umi_dashboard',
-        CASE WHEN ${status} = 'invited' THEN now() ELSE NULL END
-      )
-      RETURNING
-        id::text,
-        name,
-        phone,
-        email,
-        role,
-        status,
-        permissions,
-        invited_at AS "invitedAt",
-        disabled_at AS "disabledAt",
-        created_at AS "createdAt",
-        updated_at AS "updatedAt"
-    `
-    return res.status(201).json({ staff: staffDto(rows[0]) })
   } catch (err) {
     if (err.code === 'P2010' || /unique/i.test(err.message)) {
       return res.status(409).json({ error: 'Staff member already exists for this business' })
@@ -2602,7 +2282,7 @@ app.patch('/api/:slug/admin/staff/:staffId', async (req, res) => {
     const hasPermissions = Object.prototype.hasOwnProperty.call(req.body, 'permissions')
     const status = hasStatus && ['active', 'invited', 'disabled'].includes(req.body.status) ? req.body.status : null
 
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       const rows = await prisma.$queryRaw`
         UPDATE platform.staff_members
         SET
@@ -2629,41 +2309,6 @@ app.patch('/api/:slug/admin/staff/:staffId', async (req, res) => {
       if (!rows[0]) return res.status(404).json({ error: 'Staff member not found' })
       return res.json({ staff: staffDto(rows[0]) })
     }
-
-    const rows = await prisma.$queryRaw`
-      UPDATE conversaflow.staff_members
-      SET
-        name = CASE WHEN ${hasName} THEN ${String(req.body.name || '').trim()} ELSE name END,
-        phone = CASE WHEN ${hasPhone} THEN NULLIF(${String(req.body.phone || '').trim()}, '') ELSE phone END,
-        email = CASE WHEN ${hasEmail} THEN NULLIF(${String(req.body.email || '').trim()}, '') ELSE email END,
-        role = CASE WHEN ${hasRole} THEN ${normalizeRole(req.body.role)} ELSE role END,
-        status = CASE WHEN ${hasStatus} THEN COALESCE(${status}, status) ELSE status END,
-        permissions = CASE
-          WHEN ${hasPermissions} THEN ${JSON.stringify(req.body.permissions || {})}::jsonb
-          ELSE permissions
-        END,
-        disabled_at = CASE
-          WHEN ${hasStatus} AND ${status} = 'disabled' THEN COALESCE(disabled_at, now())
-          WHEN ${hasStatus} AND ${status} <> 'disabled' THEN NULL
-          ELSE disabled_at
-        END
-      WHERE id = ${req.params.staffId}::uuid
-        AND business_id = ${ctx.businessId}::uuid
-      RETURNING
-        id::text,
-        name,
-        phone,
-        email,
-        role,
-        status,
-        permissions,
-        invited_at AS "invitedAt",
-        disabled_at AS "disabledAt",
-        created_at AS "createdAt",
-        updated_at AS "updatedAt"
-    `
-    if (!rows[0]) return res.status(404).json({ error: 'Staff member not found' })
-    return res.json({ staff: staffDto(rows[0]) })
   } catch (err) {
     return res.status(500).json({ error: err.message })
   }
@@ -2675,7 +2320,7 @@ app.delete('/api/:slug/admin/staff/:staffId', async (req, res) => {
     if (!ctx) return notFound(res)
     if (!ctx.businessId) return businessNotLinked(res)
 
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       const rows = await prisma.$queryRaw`
         UPDATE platform.staff_members
         SET status = 'disabled', updated_at = now()
@@ -2686,16 +2331,6 @@ app.delete('/api/:slug/admin/staff/:staffId', async (req, res) => {
       if (!rows[0]) return res.status(404).json({ error: 'Staff member not found' })
       return res.json({ ok: true })
     }
-
-    const rows = await prisma.$queryRaw`
-      UPDATE conversaflow.staff_members
-      SET status = 'disabled', disabled_at = COALESCE(disabled_at, now())
-      WHERE id = ${req.params.staffId}::uuid
-        AND business_id = ${ctx.businessId}::uuid
-      RETURNING id::text
-    `
-    if (!rows[0]) return res.status(404).json({ error: 'Staff member not found' })
-    return res.json({ ok: true })
   } catch (err) {
     return res.status(500).json({ error: err.message })
   }
@@ -2738,7 +2373,7 @@ app.get('/api/:slug/admin/hours', async (req, res) => {
       const dflt = Object.fromEntries(Object.values(DAY_NUM_TO_ID).map(id => [id, { open: true, from: '08:00', to: '20:00' }]))
       return res.json({ hours: dflt, timezone: 'America/Mexico_City', businessId: null })
     }
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       const rows = await prisma.$queryRaw`
         SELECT weekly_hours, timezone
         FROM commerce.business_hours
@@ -2752,11 +2387,6 @@ app.get('/api/:slug/admin/hours', async (req, res) => {
       const hours = weeklyHours?.days ? openTimesToHours(weeklyHours) : (weeklyHours && Object.keys(weeklyHours).length ? weeklyHours : dflt)
       return res.json({ hours, timezone: rows[0]?.timezone || ctx.tenant.timezone || 'America/Mexico_City', businessId: ctx.tenantId })
     }
-    const rows = await prisma.$queryRaw`SELECT open_times, config FROM conversaflow.businesses WHERE id = ${ctx.businessId}::uuid LIMIT 1`
-    const biz = rows[0]
-    const openTimes = biz?.open_times
-    const tz = openTimes?.timezone || biz?.config?.timezone || 'America/Mexico_City'
-    return res.json({ hours: openTimesToHours(openTimes), timezone: tz, businessId: ctx.businessId })
   } catch (err) {
     console.error('[hours GET]', err.message)
     return res.status(500).json({ error: err.message })
@@ -2770,7 +2400,7 @@ app.patch('/api/:slug/admin/hours', async (req, res) => {
     if (!ctx.businessId) return businessNotLinked(res)
     const { hours, timezone } = req.body
     if (!hours) return res.status(400).json({ error: 'hours required' })
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       const updated = await prisma.$queryRaw`
         UPDATE commerce.business_hours
         SET
@@ -2794,8 +2424,6 @@ app.patch('/api/:slug/admin/hours', async (req, res) => {
       }
       return res.json({ ok: true })
     }
-    await prisma.$executeRaw`UPDATE conversaflow.businesses SET open_times = ${JSON.stringify(hoursToOpenTimes(hours, timezone))}::jsonb WHERE id = ${ctx.businessId}::uuid`
-    return res.json({ ok: true })
   } catch (err) {
     console.error('[hours PATCH]', err.message)
     return res.status(500).json({ error: err.message })
@@ -2820,7 +2448,7 @@ app.get('/api/:slug/orders', async (req, res) => {
     const filter = req.query.filter || 'active'
     const statuses = ORDER_STATUS_MAP[filter] || ORDER_STATUS_MAP.all
 
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       const rows = await prisma.$queryRaw`
         SELECT
           t.id::text AS ticket_id,
@@ -2863,45 +2491,6 @@ app.get('/api/:slug/orders', async (req, res) => {
       `
       return res.json({ orders: rows })
     }
-
-    const rows = await prisma.$queryRaw`
-      SELECT
-        t.ticket_id::text,
-        t.status::text,
-        t.customer_name,
-        t.customer_phone,
-        t.station_id,
-        t.station_name,
-        t.customer_note,
-        t.total_amount,
-        t.created_at,
-        t.updated_at,
-        count(i.ticket_item_id)::int AS items_count,
-        COALESCE(
-          jsonb_agg(
-            jsonb_build_object(
-              'ticket_item_id', i.ticket_item_id::text,
-              'name', i.name,
-              'quantity', i.quantity,
-              'variant_name', i.variant_name,
-              'notes', i.notes,
-              'unit_price', i.unit_price,
-              'is_cancelled', i.is_cancelled
-            )
-            ORDER BY i.display_order ASC
-          ) FILTER (WHERE i.ticket_item_id IS NOT NULL),
-          '[]'::jsonb
-        ) AS items
-      FROM kds.tickets AS t
-      LEFT JOIN kds.ticket_items AS i
-        ON i.ticket_id = t.ticket_id
-      WHERE t.business_id = ${ctx.businessId}::uuid
-        AND t.status::text IN (${Prisma.join(statuses)})
-      GROUP BY t.ticket_id
-      ORDER BY t.created_at DESC
-      LIMIT 100
-    `
-    return res.json({ orders: rows })
   } catch (err) {
     console.error('[orders GET]', err.message)
     return res.status(500).json({ error: err.message })
@@ -2919,7 +2508,7 @@ app.post('/api/:slug/orders/:ticketId/transition', async (req, res) => {
       return res.status(400).json({ error: 'Invalid target status' })
     }
 
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       const rows = await prisma.$queryRaw`
         UPDATE kds.tickets
         SET status = ${targetStatus}, updated_at = now()
@@ -2931,42 +2520,6 @@ app.post('/api/:slug/orders/:ticketId/transition', async (req, res) => {
       if (!rows[0]) return res.status(404).json({ error: 'Ticket not found' })
       return res.json({ ok: true, ticket: rows[0] })
     }
-
-    const owned = await prisma.$queryRaw`
-      SELECT ticket_id::text
-      FROM kds.tickets
-      WHERE ticket_id = ${req.params.ticketId}::uuid
-        AND business_id = ${ctx.businessId}::uuid
-      LIMIT 1
-    `
-    if (!owned[0]) return res.status(404).json({ error: 'Ticket not found' })
-
-    const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
-    const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
-    if (!supabaseUrl || !serviceRoleKey) {
-      return res.status(500).json({ error: 'SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for KDS mutations' })
-    }
-
-    const edgeRes = await fetch(`${supabaseUrl.replace(/\/$/, '')}/functions/v1/kds-command`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${serviceRoleKey}`,
-        'apikey': serviceRoleKey,
-      },
-      body: JSON.stringify({
-        action: 'transition_ticket',
-        ticket_id: req.params.ticketId,
-        target_status: targetStatus,
-        actor_id: 'umi-dashboard',
-        actor_channel: 'owner_dashboard',
-        cancellation_reason_code: req.body.cancellation_reason_code ?? null,
-        cancellation_reason_note: req.body.cancellation_reason_note ?? null,
-      }),
-    })
-    const payload = await edgeRes.json().catch(() => ({}))
-    if (!edgeRes.ok) return res.status(edgeRes.status).json(payload)
-    return res.json(payload)
   } catch (err) {
     console.error('[orders transition]', err.message)
     return res.status(500).json({ error: err.message })
@@ -2981,7 +2534,7 @@ app.get('/api/:slug/admin/devices', async (req, res) => {
     if (!ctx) return notFound(res)
     if (!ctx.businessId) return businessNotLinked(res)
 
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       const rows = await prisma.$queryRaw`
         SELECT
           ds.id::text AS device_id,
@@ -3011,30 +2564,6 @@ app.get('/api/:slug/admin/devices', async (req, res) => {
       `
       return res.json({ devices: rows })
     }
-
-    const rows = await prisma.$queryRaw`
-      SELECT
-        ds.device_id::text,
-        ds.device_name,
-        ds.station_id,
-        ds.created_at,
-        ds.last_used_at,
-        ds.is_active,
-        COALESCE(open_counts.open_count, 0)::int AS open
-      FROM kds.device_sessions AS ds
-      LEFT JOIN (
-        SELECT station_id, count(*) AS open_count
-        FROM kds.tickets
-        WHERE business_id = ${ctx.businessId}::uuid
-          AND status IN ('new', 'accepted', 'preparing', 'ready')
-        GROUP BY station_id
-      ) AS open_counts
-        ON open_counts.station_id IS NOT DISTINCT FROM ds.station_id
-      WHERE ds.business_id = ${ctx.businessId}::uuid
-        AND ds.is_active = true
-      ORDER BY ds.last_used_at DESC NULLS LAST, ds.created_at DESC
-    `
-    return res.json({ devices: rows })
   } catch (err) {
     console.error('[devices GET]', err.message)
     return res.status(500).json({ error: err.message })
@@ -3046,9 +2575,6 @@ app.get('/api/:slug/admin/stations', async (req, res) => {
     const ctx = await getDashboardContext(req.params.slug, req.query.locationId || null)
     if (!ctx) return notFound(res)
     if (!ctx.businessId) return businessNotLinked(res)
-    if (!PLATFORM_TRANSITION_SCHEMA) {
-      return res.status(409).json({ error: 'KDS station UUIDs require the platform transition schema' })
-    }
 
     const rows = await prisma.$queryRaw`
       SELECT id::text, station_key, name, status
@@ -3070,9 +2596,6 @@ app.get('/api/:slug/admin/devices/pairing', async (req, res) => {
     const ctx = await getDashboardContext(req.params.slug, req.query.locationId || null)
     if (!ctx) return notFound(res)
     if (!ctx.businessId) return businessNotLinked(res)
-    if (!PLATFORM_TRANSITION_SCHEMA) {
-      return res.status(409).json({ error: 'KDS pairing requires the platform transition schema' })
-    }
 
     const payload = await callKdsPairing('admin_list', {
       tenant_id: ctx.tenantId,
@@ -3090,9 +2613,6 @@ app.post('/api/:slug/admin/devices/pairing-pin', async (req, res) => {
     const ctx = await getDashboardContext(req.params.slug, req.query.locationId || null)
     if (!ctx) return notFound(res)
     if (!ctx.businessId) return businessNotLinked(res)
-    if (!PLATFORM_TRANSITION_SCHEMA) {
-      return res.status(409).json({ error: 'KDS pairing requires the platform transition schema' })
-    }
 
     const deviceName = String(req.body.device_name || req.body.deviceName || '').trim()
     const stationId = String(req.body.station_id || req.body.stationId || '').trim()
@@ -3116,9 +2636,6 @@ app.post('/api/:slug/admin/devices/pairing/:pairingId/approve', async (req, res)
     const ctx = await getDashboardContext(req.params.slug, req.query.locationId || null)
     if (!ctx) return notFound(res)
     if (!ctx.businessId) return businessNotLinked(res)
-    if (!PLATFORM_TRANSITION_SCHEMA) {
-      return res.status(409).json({ error: 'KDS pairing requires the platform transition schema' })
-    }
     const userId = getCurrentUserId(req)
     if (!userId) return res.status(401).json({ error: 'authentication_required' })
 
@@ -3139,9 +2656,6 @@ app.post('/api/:slug/admin/devices/pairing/:pairingId/deny', async (req, res) =>
     const ctx = await getDashboardContext(req.params.slug, req.query.locationId || null)
     if (!ctx) return notFound(res)
     if (!ctx.businessId) return businessNotLinked(res)
-    if (!PLATFORM_TRANSITION_SCHEMA) {
-      return res.status(409).json({ error: 'KDS pairing requires the platform transition schema' })
-    }
 
     const payload = await callKdsPairing('admin_deny', {
       tenant_id: ctx.tenantId,
@@ -3164,7 +2678,7 @@ app.post('/api/:slug/admin/devices/provision', async (req, res) => {
     const stationId = String(req.body.station_id || req.body.stationId || '').trim() || null
     if (!deviceName) return res.status(400).json({ error: 'device_name is required' })
 
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       const rows = await prisma.$queryRaw`
         WITH token AS (
           SELECT encode(gen_random_bytes(32), 'hex') AS value
@@ -3185,25 +2699,6 @@ app.post('/api/:slug/admin/devices/provision', async (req, res) => {
       `
       return res.status(201).json({ device: rows[0] })
     }
-
-    const rows = await prisma.$queryRaw`
-      WITH token AS (
-        SELECT encode(gen_random_bytes(32), 'hex') AS value
-      ),
-      inserted AS (
-        INSERT INTO kds.device_sessions (business_id, device_name, station_id, token_hash)
-        SELECT
-          ${ctx.businessId}::uuid,
-          ${deviceName},
-          ${stationId},
-          encode(sha256(token.value::bytea), 'hex')
-        FROM token
-        RETURNING device_id::text, business_id::text, device_name, station_id, created_at, is_active
-      )
-      SELECT inserted.*, token.value AS token
-      FROM inserted, token
-    `
-    return res.status(201).json({ device: rows[0] })
   } catch (err) {
     console.error('[devices provision]', err.message)
     return res.status(500).json({ error: err.message })
@@ -3219,7 +2714,7 @@ app.post('/api/:slug/admin/devices/:deviceId/revoke', async (req, res) => {
     const reason = String(req.body.reason || 'removed_from_dashboard').trim() || 'removed_from_dashboard'
     const revokedBy = getCurrentUserId(req)
 
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       const rows = await prisma.$queryRaw`
         UPDATE kds.device_sessions
         SET
@@ -3236,21 +2731,6 @@ app.post('/api/:slug/admin/devices/:deviceId/revoke', async (req, res) => {
       _kdsHeartbeats.delete(req.params.deviceId)
       return res.json({ ok: true, device_id: rows[0].device_id, revoked_at: rows[0].revoked_at })
     }
-
-    const rows = await prisma.$queryRaw`
-      UPDATE kds.device_sessions
-      SET
-        is_active = false,
-        revoked_at = COALESCE(revoked_at, now()),
-        revoked_by = COALESCE(${revokedBy}::uuid, revoked_by),
-        revocation_reason = ${reason}
-      WHERE device_id = ${req.params.deviceId}::uuid
-        AND business_id = ${ctx.businessId}::uuid
-      RETURNING device_id::text, revoked_at
-    `
-    if (!rows[0]) return res.status(404).json({ error: 'Device not found' })
-    _kdsHeartbeats.delete(req.params.deviceId)
-    return res.json({ ok: true, device_id: rows[0].device_id, revoked_at: rows[0].revoked_at })
   } catch (err) {
     console.error('[devices revoke]', err.message)
     return res.status(500).json({ error: err.message })
@@ -3266,7 +2746,7 @@ app.patch('/api/:slug/admin/devices/:deviceId', async (req, res) => {
     const isActive = req.body.is_active ?? req.body.isActive
     const revokedBy = getCurrentUserId(req)
     const shouldRevoke = isActive === false
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       const rows = await prisma.$queryRaw`
         UPDATE kds.device_sessions
         SET
@@ -3300,37 +2780,6 @@ app.patch('/api/:slug/admin/devices/:deviceId', async (req, res) => {
       if (shouldRevoke) _kdsHeartbeats.delete(req.params.deviceId)
       return res.json({ ok: true })
     }
-    const rows = await prisma.$queryRaw`
-      UPDATE kds.device_sessions
-      SET
-        is_active = COALESCE(${typeof isActive === 'boolean' ? isActive : null}, is_active),
-        revoked_at = CASE
-          WHEN ${shouldRevoke} THEN COALESCE(revoked_at, now())
-          ELSE revoked_at
-        END,
-        revoked_by = CASE
-          WHEN ${shouldRevoke} THEN COALESCE(${revokedBy}::uuid, revoked_by)
-          ELSE revoked_by
-        END,
-        revocation_reason = CASE
-          WHEN ${shouldRevoke} THEN COALESCE(${req.body.revocation_reason || req.body.reason || 'removed_from_dashboard'}, revocation_reason)
-          ELSE revocation_reason
-        END,
-        device_name = CASE
-          WHEN ${Object.prototype.hasOwnProperty.call(req.body, 'device_name')} THEN ${String(req.body.device_name || '').trim()}
-          ELSE device_name
-        END,
-        station_id = CASE
-          WHEN ${Object.prototype.hasOwnProperty.call(req.body, 'station_id')} THEN NULLIF(${String(req.body.station_id || '').trim()}, '')
-          ELSE station_id
-        END
-      WHERE device_id = ${req.params.deviceId}::uuid
-        AND business_id = ${ctx.businessId}::uuid
-      RETURNING device_id::text
-    `
-    if (!rows[0]) return res.status(404).json({ error: 'Device not found' })
-    if (shouldRevoke) _kdsHeartbeats.delete(req.params.deviceId)
-    return res.json({ ok: true })
   } catch (err) {
     console.error('[devices PATCH]', err.message)
     return res.status(500).json({ error: err.message })
@@ -3345,7 +2794,7 @@ app.get('/api/:slug/admin/ticker', async (req, res) => {
     if (!ctx) return notFound(res)
     if (!ctx.businessId) return businessNotLinked(res)
 
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       const rows = await prisma.$queryRaw`
         SELECT
           e.sequence::text,
@@ -3378,35 +2827,6 @@ app.get('/api/:slug/admin/ticker', async (req, res) => {
       }))
       return res.json({ events })
     }
-
-    const rows = await prisma.$queryRaw`
-      SELECT
-        e.sequence::text,
-        e.kind::text,
-        e.status::text,
-        e.occurred_at,
-        e.payload,
-        t.customer_name,
-        t.station_name,
-        t.total_amount
-      FROM kds.ticket_events AS e
-      LEFT JOIN kds.tickets AS t
-        ON t.ticket_id = e.ticket_id
-      WHERE e.business_id = ${ctx.businessId}::uuid
-      ORDER BY e.sequence DESC
-      LIMIT 20
-    `
-
-    const events = rows.map(row => ({
-      id: row.sequence,
-      time: row.occurred_at?.toLocaleTimeString?.('es-MX', { hour: '2-digit', minute: '2-digit' }) ?? '',
-      kind: row.kind === 'status_changed' ? 'kds' : 'ord',
-      text: row.status
-        ? `${row.station_name || 'KDS'} marcó ticket ${row.status}`
-        : `${row.customer_name || 'Pedido WhatsApp'} actualizado`,
-      actor: row.total_amount ? `$ ${Number(row.total_amount).toLocaleString('es-MX')} MXN` : null,
-    }))
-    return res.json({ events })
   } catch (err) {
     console.error('[ticker GET]', err.message)
     return res.status(500).json({ error: err.message })
@@ -3465,7 +2885,7 @@ app.get('/api/:slug/admin/conversations', async (req, res) => {
     if (!ctx.businessId) return businessNotLinked(res)
     const { page, limit, skip } = parsePagination(req.query)
 
-    if (PLATFORM_TRANSITION_SCHEMA) {
+    {
       const rows = await prisma.$queryRaw`
         SELECT
           c.id::text,
@@ -3500,40 +2920,6 @@ app.get('/api/:slug/admin/conversations', async (req, res) => {
         totalPages: Math.ceil((countRows[0]?.total ?? 0) / limit),
       })
     }
-
-    const rows = await prisma.$queryRaw`
-      SELECT
-        c.id::text,
-        c.status,
-        c.current_state AS "currentState",
-        c.summary,
-        c.created_at AS "createdAt",
-        cu.name AS "customerName",
-        cu.phone AS "customerPhone",
-        count(m.id)::int AS "messageCount",
-        max(m.created_at) AS "lastMessageAt"
-      FROM conversaflow.conversations AS c
-      LEFT JOIN conversaflow.customers AS cu
-        ON cu.id = c.customer_id
-      LEFT JOIN conversaflow.messages AS m
-        ON m.conversation_id = c.id
-      WHERE c.business_id = ${ctx.businessId}::uuid
-      GROUP BY c.id, cu.id
-      ORDER BY COALESCE(max(m.created_at), c.created_at) DESC
-      OFFSET ${skip}
-      LIMIT ${limit}
-    `
-    const countRows = await prisma.$queryRaw`
-      SELECT count(*)::int AS total
-      FROM conversaflow.conversations
-      WHERE business_id = ${ctx.businessId}::uuid
-    `
-    return res.json({
-      conversations: rows,
-      total: countRows[0]?.total ?? 0,
-      page,
-      totalPages: Math.ceil((countRows[0]?.total ?? 0) / limit),
-    })
   } catch (err) {
     console.error('[conversations GET]', err.message)
     return res.status(500).json({ error: err.message })
@@ -3544,18 +2930,23 @@ app.get('/api/:slug/admin/conversations', async (req, res) => {
 
 const PORT = parseInt(process.env.PORT || '4001')
 
-prisma.$connect().then(() => {
-  app.listen(PORT, () => {
-    const db = process.env.DATABASE_URL
-      ? process.env.DATABASE_URL.replace(/:([^:@]+)@/, ':***@')
-      : '⚠  DATABASE_URL not set'
-    console.log('')
-    console.log(`  Umi Dashboard API  →  http://localhost:${PORT}`)
-    console.log(`  umi-cash DB        →  ${db}`)
-    console.log(`  Frontend (Vite)    →  http://localhost:${process.env.VITE_DEV_PORT || '4000'}`)
-    console.log('')
+if (!process.env.VERCEL && process.env.UMI_DASHBOARD_DISABLE_LISTEN !== '1') {
+  prisma.$connect().then(() => {
+    app.listen(PORT, () => {
+      const db = process.env.DATABASE_URL
+        ? process.env.DATABASE_URL.replace(/:([^:@]+)@/, ':***@')
+        : '⚠  DATABASE_URL not set'
+      console.log('')
+      console.log(`  Umi Dashboard API  →  http://localhost:${PORT}`)
+      console.log(`  umi-cash DB        →  ${db}`)
+      console.log(`  Frontend (Vite)    →  http://localhost:${process.env.VITE_DEV_PORT || '4000'}`)
+      console.log('')
+    })
+  }).catch(err => {
+    console.error('Failed to connect to database:', err.message)
+    process.exit(1)
   })
-}).catch(err => {
-  console.error('Failed to connect to database:', err.message)
-  process.exit(1)
-})
+}
+
+export { app, prisma }
+export default app
