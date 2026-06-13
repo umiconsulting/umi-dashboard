@@ -1017,25 +1017,10 @@ async function callKdsPairingBackend(action, body) {
   return payload
 }
 
-// ── Local KDS pairing (used when SUPABASE_URL is not set — local dev only) ───
-
-const PIN_TTL_MINUTES = 10
-const MAX_PAIRING_ATTEMPTS = 5
-
-function _randomPin() {
-  const max = 0xffffffff - (0xffffffff % 1_000_000)
-  let val
-  do { val = randomBytes(4).readUInt32BE(0) } while (val >= max)
-  return String(val % 1_000_000).padStart(6, '0')
-}
-
 function _sha256Hex(value) {
   return createHash('sha256').update(value).digest('hex')
 }
 
-function _hashPin(pin, salt) {
-  return _sha256Hex(`${salt}:${pin}`)
-}
 
 function kdsRevokedPayload() {
   return {
