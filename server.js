@@ -1091,222 +1091,15 @@ async function verifyLocalKdsDevice(req) {
   }
 }
 
-async function callKdsPairingLocal(action, body) {
-  const tenantId = body.tenant_id || null
-  const locationId = body.location_id || null
-  const now = new Date()
-
-  if (action === 'kds_start') {
-    const cleanPin = String(body.pin || '').replace(/\s+/g, '')
-    if (!/^\d{6}$/.test(cleanPin)) {
-      const err = new Error('invalid_pin'); err.status = 400; throw err
-    }
-    const requestedName = String(body.device_name || 'Kitchen iPad').trim() || 'Kitchen iPad'
-
-    const pairings = await prisma.$queryRaw`
-      SELECT id::text, pin_hash, pin_salt, attempt_count, max_attempts, expires_at
-      FROM kds.device_pairing_requests
-      WHERE status = 'pending' AND expires_at > ${now}
-      ORDER BY created_at DESC LIMIT 50
-    `
-    for (const p of pairings) {
-      if (p.attempt_count >= p.max_attempts) continue
-      if (_hashPin(cleanPin, p.pin_salt) !== p.pin_hash) continue
-
-      await prisma.$queryRaw`
-        UPDATE kds.device_pairing_requests
-        SET requested_name = ${requestedName}, updated_at = ${now}
-        WHERE id = ${p.id}::uuid AND status = 'pending'
-      `
-      return { pairing_id: p.id, status: 'pending', poll_after_seconds: 5, expires_at: p.expires_at }
-    }
-    const err = new Error('pairing_not_found'); err.status = 404; throw err
-  }
-
-  if (action === 'kds_status') {
-    const pairingId = String(body.pairing_id || '').trim()
-    if (!pairingId) { const err = new Error('missing_pairing_id'); err.status = 400; throw err }
-
-    const rows = await prisma.$queryRaw`
-      SELECT id::text, tenant_id::text, location_id::text, station_id::text,
-             device_name, requested_name, status, expires_at, used_at
-      FROM kds.device_pairing_requests WHERE id = ${pairingId}::uuid LIMIT 1
-    `
-    if (!rows.length) { const err = new Error('pairing_not_found'); err.status = 404; throw err }
-    const pairing = rows[0]
-
-    if (pairing.status === 'pending' && new Date(pairing.expires_at).getTime() <= Date.now()) {
-      await prisma.$queryRaw`
-        UPDATE kds.device_pairing_requests SET status = 'expired', updated_at = ${now}
-        WHERE id = ${pairingId}::uuid AND status = 'pending'
-      `
-      return { status: 'expired' }
-    }
-
-    if (pairing.status !== 'approved') {
-      return { status: pairing.status, ...(pairing.status === 'pending' ? { poll_after_seconds: 5 } : {}) }
-    }
-
-    if (pairing.used_at) return { status: 'used' }
-
-    const stationRows = await prisma.$queryRaw`
-      SELECT id::text, name FROM kds.stations
-      WHERE id = ${pairing.station_id}::uuid AND tenant_id = ${pairing.tenant_id}::uuid LIMIT 1
-    `
-    if (!stationRows.length) { const err = new Error('station_not_found'); err.status = 404; throw err }
-    const station = stationRows[0]
-
-    const token = randomBytes(32).toString('hex')
-    const tokenHash = _sha256Hex(token)
-    const sessionRows = await prisma.$queryRaw`
-      INSERT INTO kds.device_sessions (tenant_id, location_id, station_id, device_name, token_hash, is_active)
-      VALUES (
-        ${pairing.tenant_id}::uuid, ${pairing.location_id}::uuid, ${pairing.station_id}::uuid,
-        ${pairing.requested_name || pairing.device_name}, ${tokenHash}, true
-      )
-      RETURNING id::text, tenant_id::text, location_id::text, station_id::text, device_name
-    `
-    const session = sessionRows[0]
-
-    const claimed = await prisma.$queryRaw`
-      UPDATE kds.device_pairing_requests
-      SET status = 'used', used_at = ${now}, updated_at = ${now}
-      WHERE id = ${pairingId}::uuid AND status = 'approved' AND used_at IS NULL
-      RETURNING id::text
-    `
-    if (!claimed.length) {
-      await prisma.$queryRaw`DELETE FROM kds.device_sessions WHERE id = ${session.id}::uuid`
-      return { status: 'used' }
-    }
-
-    return {
-      status: 'approved',
-      device_session: {
-        device_id: session.id,
-        token,
-        business_id: session.tenant_id,
-        tenant_id: session.tenant_id,
-        location_id: session.location_id,
-        station_id: session.station_id,
-        station_name: station.name,
-        device_name: session.device_name,
-      },
-    }
-  }
-
-  if (action === 'admin_create_pin') {
-    const { station_id: stationId, device_name: deviceName } = body
-    const rows = await prisma.$queryRaw`
-      SELECT id::text, name FROM kds.stations
-      WHERE id = ${stationId}::uuid AND tenant_id = ${tenantId}::uuid AND status = 'active'
-      LIMIT 1
-    `
-    if (!rows.length) {
-      const err = new Error('station_not_found'); err.status = 404; throw err
-    }
-    const station = rows[0]
-    const pin = _randomPin()
-    const pinSalt = randomBytes(16).toString('hex')
-    const pinHash = _hashPin(pin, pinSalt)
-    const expiresAt = new Date(now.getTime() + PIN_TTL_MINUTES * 60_000)
-
-    const inserted = await prisma.$queryRaw`
-      INSERT INTO kds.device_pairing_requests
-        (tenant_id, location_id, station_id, device_name, pin_hash, pin_salt, status, max_attempts, expires_at)
-      VALUES (
-        ${tenantId}::uuid,
-        ${locationId}::uuid,
-        ${stationId}::uuid,
-        ${deviceName},
-        ${pinHash},
-        ${pinSalt},
-        'pending',
-        ${MAX_PAIRING_ATTEMPTS},
-        ${expiresAt}
-      )
-      RETURNING id::text, tenant_id::text, location_id::text, station_id::text,
-                device_name, status, expires_at, created_at
-    `
-    const row = inserted[0]
-    return {
-      pairing: {
-        ...row,
-        station_name: station.name,
-        pin,
-        poll_after_seconds: 5,
-      },
-    }
-  }
-
-  if (action === 'admin_list') {
-    const rows = await prisma.$queryRaw`
-      SELECT id::text, tenant_id::text, location_id::text, station_id::text,
-             device_name, requested_name, status, attempt_count, max_attempts,
-             expires_at, approved_by::text, approved_at, used_at, denied_at, created_at
-      FROM kds.device_pairing_requests
-      WHERE tenant_id = ${tenantId}::uuid
-        AND (${locationId}::uuid IS NULL OR location_id IS NOT DISTINCT FROM ${locationId}::uuid)
-        AND status IN ('pending', 'approved')
-        AND expires_at > ${now}
-      ORDER BY created_at DESC
-      LIMIT 20
-    `
-    return { pairings: rows }
-  }
-
-  if (action === 'admin_approve') {
-    const { pairing_id: pairingId, admin_user_id: adminUserId } = body
-    const rows = await prisma.$queryRaw`
-      UPDATE kds.device_pairing_requests
-      SET status = 'approved',
-          approved_by = ${adminUserId}::uuid,
-          approved_at = ${now},
-          updated_at = ${now}
-      WHERE id = ${pairingId}::uuid
-        AND tenant_id = ${tenantId}::uuid
-        AND status = 'pending'
-        AND expires_at > ${now}
-      RETURNING id::text, status
-    `
-    if (!rows.length) {
-      const err = new Error('pairing_not_pending'); err.status = 409; throw err
-    }
-    return { ok: true, pairing: rows[0] }
-  }
-
-  if (action === 'admin_deny') {
-    const { pairing_id: pairingId } = body
-    await prisma.$queryRaw`
-      UPDATE kds.device_pairing_requests
-      SET status = 'denied', denied_at = ${now}, updated_at = ${now}
-      WHERE id = ${pairingId}::uuid
-        AND tenant_id = ${tenantId}::uuid
-        AND status = 'pending'
-    `
-    return { ok: true }
-  }
-
-  const err = new Error('unknown_action'); err.status = 400; throw err
-}
-
-function callKdsPairing(action, body) {
-  const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
-  if (supabaseUrl && serviceRoleKey) return callKdsPairingBackend(action, body)
-  return callKdsPairingLocal(action, body)
-}
-
 // ── KDS device pairing (iPad-facing, no auth — PIN is the credential) ────────
-// Used by the KDS iPad app when KDSPairingURL in Info.plist points here.
-// Only active in local mode (when SUPABASE_URL is not set); safe to expose
-// because kds_start requires a valid PIN and kds_status requires a valid UUID.
+// Routes to the canonical kds-pairing edge function (S4.2 dedup).
 app.post('/api/kds/pairing', async (req, res) => {
   const action = String((req.body || {}).action || '').trim()
   if (action !== 'kds_start' && action !== 'kds_status') {
     return res.status(400).json({ error: 'unknown_action' })
   }
   try {
-    const payload = await callKdsPairingLocal(action, req.body || {})
+    const payload = await callKdsPairingBackend(action, req.body || {})
     return res.json(payload)
   } catch (err) {
     console.error('[kds pairing public]', err.message)
@@ -2597,7 +2390,7 @@ app.get('/api/:slug/admin/devices/pairing', async (req, res) => {
     if (!ctx) return notFound(res)
     if (!ctx.businessId) return businessNotLinked(res)
 
-    const payload = await callKdsPairing('admin_list', {
+    const payload = await callKdsPairingBackend('admin_list', {
       tenant_id: ctx.tenantId,
       location_id: ctx.locationId,
     })
@@ -2618,7 +2411,7 @@ app.post('/api/:slug/admin/devices/pairing-pin', async (req, res) => {
     const stationId = String(req.body.station_id || req.body.stationId || '').trim()
     if (!deviceName || !stationId) return res.status(400).json({ error: 'device_name and station_id are required' })
 
-    const payload = await callKdsPairing('admin_create_pin', {
+    const payload = await callKdsPairingBackend('admin_create_pin', {
       tenant_id: ctx.tenantId,
       location_id: ctx.locationId,
       station_id: stationId,
@@ -2639,7 +2432,7 @@ app.post('/api/:slug/admin/devices/pairing/:pairingId/approve', async (req, res)
     const userId = getCurrentUserId(req)
     if (!userId) return res.status(401).json({ error: 'authentication_required' })
 
-    const payload = await callKdsPairing('admin_approve', {
+    const payload = await callKdsPairingBackend('admin_approve', {
       tenant_id: ctx.tenantId,
       pairing_id: req.params.pairingId,
       admin_user_id: userId,
@@ -2657,7 +2450,7 @@ app.post('/api/:slug/admin/devices/pairing/:pairingId/deny', async (req, res) =>
     if (!ctx) return notFound(res)
     if (!ctx.businessId) return businessNotLinked(res)
 
-    const payload = await callKdsPairing('admin_deny', {
+    const payload = await callKdsPairingBackend('admin_deny', {
       tenant_id: ctx.tenantId,
       pairing_id: req.params.pairingId,
     })
