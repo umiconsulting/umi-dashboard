@@ -11,7 +11,7 @@
     "dev:local": "concurrently --names \"API,UI\" -c \"cyan,magenta\" \"node --watch --env-file=.env.local-postgres server.js\" \"vite --mode local-postgres\"",
     "api:local": "node --env-file=.env.local-postgres server.js",
     "postinstall": "prisma generate",
-    "build": "vite build",
+    "build": "npx vite build",
     "api:check": "node --check server.js && node --check api/index.js",
     "preview": "node --env-file=.env server.js",
     "preview:local": "node --env-file=.env.local-postgres server.js",
