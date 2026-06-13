@@ -3,6 +3,9 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "dev": "concurrently --names \"API,UI\" -c \"cyan,magenta\" \"node --watch --env-file=.env server.js\" \"vite\"",
     "dev:local": "concurrently --names \"API,UI\" -c \"cyan,magenta\" \"node --watch --env-file=.env.local-postgres server.js\" \"vite --mode local-postgres\"",
