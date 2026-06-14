@@ -674,7 +674,7 @@ async function loadPlatformCustomers(capabilities, options = {}) {
     LEFT JOIN LATERAL (
       SELECT ci.normalized_value
       FROM platform.contact_identities AS ci
-      WHERE ci.contact_id = c.id
+      WHERE ci.person_id = c.id
         AND ci.identity_type IN ('phone', 'whatsapp')
         AND ci.normalized_value IS NOT NULL
       ORDER BY CASE WHEN ci.identity_type = 'phone' THEN 0 ELSE 1 END, ci.created_at ASC
@@ -694,7 +694,7 @@ async function loadPlatformCustomers(capabilities, options = {}) {
         ORDER BY ci.identity_type, ci.created_at
       ) AS items
       FROM platform.contact_identities AS ci
-      WHERE ci.contact_id = c.id
+      WHERE ci.person_id = c.id
     ) AS identities ON true
     LEFT JOIN LATERAL (
       SELECT
@@ -705,8 +705,8 @@ async function loadPlatformCustomers(capabilities, options = {}) {
         max(GREATEST(lc.updated_at, la.updated_at)) AS last_cash_at
       FROM cash.loyalty_accounts AS la
       LEFT JOIN cash.loyalty_cards AS lc ON lc.loyalty_account_id = la.id
-      LEFT JOIN cash.gift_cards AS gc ON gc.recipient_contact_id = c.id
-      WHERE la.contact_id = c.id
+      LEFT JOIN cash.gift_cards AS gc ON gc.recipient_person_id = c.id
+      WHERE la.person_id = c.id
     ) AS cash_summary ON true
     LEFT JOIN LATERAL (
       SELECT
@@ -714,7 +714,7 @@ async function loadPlatformCustomers(capabilities, options = {}) {
         count(cv.id) FILTER (WHERE cv.status IN ('open', 'pending', 'active')) AS active_conversations,
         max(cv.updated_at) AS last_conversation_at
       FROM conversaflow.conversations AS cv
-      WHERE cv.contact_id = c.id
+      WHERE cv.person_id = c.id
     ) AS conversation_summary ON true
     LEFT JOIN LATERAL (
       SELECT
@@ -722,12 +722,12 @@ async function loadPlatformCustomers(capabilities, options = {}) {
         COALESCE(sum(o.total_cents), 0) AS total_spend_cents,
         max(COALESCE(o.placed_at, o.created_at)) AS last_order_at
       FROM commerce.orders AS o
-      WHERE o.contact_id = c.id
+      WHERE o.person_id = c.id
     ) AS order_summary ON true
     LEFT JOIN LATERAL (
       SELECT count(mi.id) AS memory_count, max(mi.updated_at) AS last_memory_at
       FROM conversaflow.memory_items AS mi
-      WHERE mi.contact_id = c.id
+      WHERE mi.person_id = c.id
     ) AS memory_summary ON true
     LEFT JOIN LATERAL (
       SELECT count(dq.id) AS data_quality_count, max(dq.created_at) AS last_quality_at
@@ -741,7 +741,7 @@ async function loadPlatformCustomers(capabilities, options = {}) {
       FROM platform.contact_merge_candidates AS mc
       WHERE mc.tenant_id = c.tenant_id
         AND mc.confidence IN ('candidate', 'high')
-        AND (mc.left_contact_id = c.id OR mc.right_contact_id = c.id)
+        AND (mc.left_person_id = c.id OR mc.right_person_id = c.id)
     ) AS merge_summary ON true
     LEFT JOIN LATERAL (
       SELECT max(ts) AS last_touch_at
@@ -781,7 +781,7 @@ async function loadPlatformCustomers(capabilities, options = {}) {
     LEFT JOIN LATERAL (
       SELECT ci.normalized_value
       FROM platform.contact_identities AS ci
-      WHERE ci.contact_id = c.id
+      WHERE ci.person_id = c.id
         AND ci.identity_type IN ('phone', 'whatsapp')
         AND ci.normalized_value IS NOT NULL
       LIMIT 1
@@ -790,12 +790,12 @@ async function loadPlatformCustomers(capabilities, options = {}) {
       AND (${contactId} = '' OR c.id = ${contactUuid}::uuid)
       AND (
         ${filter} = ''
-        OR (${filter} = 'whatsapp' AND EXISTS (SELECT 1 FROM conversaflow.conversations AS cv WHERE cv.contact_id = c.id))
-        OR (${filter} = 'cash' AND EXISTS (SELECT 1 FROM cash.loyalty_accounts AS la WHERE la.contact_id = c.id))
-        OR (${filter} = 'memory' AND EXISTS (SELECT 1 FROM conversaflow.memory_items AS mi WHERE mi.contact_id = c.id))
+        OR (${filter} = 'whatsapp' AND EXISTS (SELECT 1 FROM conversaflow.conversations AS cv WHERE cv.person_id = c.id))
+        OR (${filter} = 'cash' AND EXISTS (SELECT 1 FROM cash.loyalty_accounts AS la WHERE la.person_id = c.id))
+        OR (${filter} = 'memory' AND EXISTS (SELECT 1 FROM conversaflow.memory_items AS mi WHERE mi.person_id = c.id))
         OR (${filter} = 'review' AND (
           EXISTS (SELECT 1 FROM observability.data_quality_findings AS dq WHERE dq.tenant_id = c.tenant_id AND dq.status = 'open' AND dq.subject_id = c.id::text)
-          OR EXISTS (SELECT 1 FROM platform.contact_merge_candidates AS mc WHERE mc.tenant_id = c.tenant_id AND mc.confidence IN ('candidate', 'high') AND (mc.left_contact_id = c.id OR mc.right_contact_id = c.id))
+          OR EXISTS (SELECT 1 FROM platform.contact_merge_candidates AS mc WHERE mc.tenant_id = c.tenant_id AND mc.confidence IN ('candidate', 'high') AND (mc.left_person_id = c.id OR mc.right_person_id = c.id))
         ))
       )
       AND (
@@ -831,15 +831,15 @@ async function loadPlatformCustomerTimeline(capabilities, contactId) {
     SELECT * FROM (
       SELECT 'whatsapp_message' AS type, m.id::text AS id, m.created_at AS occurred_at, m.role AS label, COALESCE(m.body, m.payload->>'content', '') AS detail, 'conversaflow' AS product
       FROM conversaflow.messages AS m
-      WHERE m.contact_id = ${contactId}::uuid AND m.tenant_id = ${capabilities.tenant.id}::uuid
+      WHERE m.person_id = ${contactId}::uuid AND m.tenant_id = ${capabilities.tenant.id}::uuid
       UNION ALL
       SELECT 'order' AS type, o.id::text AS id, COALESCE(o.placed_at, o.created_at) AS occurred_at, o.status AS label, COALESCE(o.order_number, o.source_ref, o.id::text) AS detail, 'orders' AS product
       FROM commerce.orders AS o
-      WHERE o.contact_id = ${contactId}::uuid AND o.tenant_id = ${capabilities.tenant.id}::uuid
+      WHERE o.person_id = ${contactId}::uuid AND o.tenant_id = ${capabilities.tenant.id}::uuid
       UNION ALL
-      SELECT 'memory' AS type, mi.id::text AS id, mi.updated_at AS occurred_at, mi.memory_type AS label, mi.content AS detail, 'memory' AS product
+      SELECT 'memory' AS type, mi.id::text AS id, mi.updated_at AS occurred_at, mi.memory_type AS label, COALESCE(mi.value->>'content', mi.value::text, '') AS detail, 'conversaflow' AS product
       FROM conversaflow.memory_items AS mi
-      WHERE mi.contact_id = ${contactId}::uuid AND mi.tenant_id = ${capabilities.tenant.id}::uuid
+      WHERE mi.person_id = ${contactId}::uuid AND mi.tenant_id = ${capabilities.tenant.id}::uuid
       UNION ALL
       SELECT 'data_quality' AS type, dq.id::text AS id, dq.created_at AS occurred_at, dq.severity AS label, dq.finding_key AS detail, 'data' AS product
       FROM observability.data_quality_findings AS dq
@@ -864,7 +864,7 @@ async function loadPlatformCustomerConversations(capabilities, contactId) {
       max(m.created_at) AS "lastMessageAt"
     FROM conversaflow.conversations AS cv
     LEFT JOIN conversaflow.messages AS m ON m.conversation_id = cv.id
-    WHERE cv.contact_id = ${contactId}::uuid
+    WHERE cv.person_id = ${contactId}::uuid
       AND cv.tenant_id = ${capabilities.tenant.id}::uuid
     GROUP BY cv.id
     ORDER BY cv.updated_at DESC
@@ -895,7 +895,7 @@ async function loadPlatformCustomerOrders(capabilities, contactId) {
       created_at,
       updated_at
     FROM commerce.orders
-    WHERE contact_id = ${contactId}::uuid
+    WHERE person_id = ${contactId}::uuid
       AND tenant_id = ${capabilities.tenant.id}::uuid
     ORDER BY COALESCE(placed_at, created_at) DESC
     LIMIT 40
@@ -928,7 +928,7 @@ async function loadPlatformCustomerCash(capabilities, contactId) {
       lc.updated_at
     FROM cash.loyalty_accounts AS la
     LEFT JOIN cash.loyalty_cards AS lc ON lc.loyalty_account_id = la.id
-    WHERE la.contact_id = ${contactId}::uuid
+    WHERE la.person_id = ${contactId}::uuid
       AND la.tenant_id = ${capabilities.tenant.id}::uuid
     ORDER BY la.created_at DESC
     LIMIT 1
@@ -959,15 +959,15 @@ async function loadPlatformCustomerIdentity(capabilities, contactId) {
     prisma.$queryRaw`
       SELECT id::text, identity_type, identity_value, normalized_value, provider, verification_status, confidence, metadata, created_at
       FROM platform.contact_identities
-      WHERE contact_id = ${contactId}::uuid
+      WHERE person_id = ${contactId}::uuid
         AND tenant_id = ${capabilities.tenant.id}::uuid
       ORDER BY identity_type, created_at
     `,
     prisma.$queryRaw`
-      SELECT id::text, left_contact_id::text, right_contact_id::text, match_type, confidence, detail, created_at, resolved_at
+      SELECT id::text, left_person_id::text, right_person_id::text, match_type, confidence, detail, created_at, resolved_at
       FROM platform.contact_merge_candidates
       WHERE tenant_id = ${capabilities.tenant.id}::uuid
-        AND (left_contact_id = ${contactId}::uuid OR right_contact_id = ${contactId}::uuid)
+        AND (left_person_id = ${contactId}::uuid OR right_person_id = ${contactId}::uuid)
       ORDER BY created_at DESC
       LIMIT 20
     `,
@@ -2676,7 +2676,7 @@ app.get('/api/:slug/admin/conversations', async (req, res) => {
           max(coalesce(m.created_at, m.received_at)) AS "lastMessageAt"
         FROM conversaflow.conversations AS c
         LEFT JOIN platform.people AS co
-          ON co.id = c.contact_id
+          ON co.id = c.person_id
         LEFT JOIN conversaflow.messages AS m
           ON m.conversation_id = c.id
         WHERE c.tenant_id = ${ctx.tenantId}::uuid
