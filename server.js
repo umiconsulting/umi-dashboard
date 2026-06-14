@@ -670,7 +670,7 @@ async function loadPlatformCustomers(capabilities, options = {}) {
       COALESCE(quality_summary.data_quality_count, 0)::int AS data_quality_count,
       COALESCE(merge_summary.merge_candidate_count, 0)::int AS merge_candidate_count,
       last_touch.last_touch_at
-    FROM platform.contacts AS c
+    FROM platform.people AS c
     LEFT JOIN LATERAL (
       SELECT ci.normalized_value
       FROM platform.contact_identities AS ci
@@ -777,7 +777,7 @@ async function loadPlatformCustomers(capabilities, options = {}) {
   `
   const countRows = await prisma.$queryRaw`
     SELECT count(*)::int AS count
-    FROM platform.contacts AS c
+    FROM platform.people AS c
     LEFT JOIN LATERAL (
       SELECT ci.normalized_value
       FROM platform.contact_identities AS ci
@@ -808,7 +808,7 @@ async function loadPlatformCustomers(capabilities, options = {}) {
   `
   const customers = rows.map((row) => platformCustomerDto(row, capabilities))
   const total = Number(countRows[0]?.count || customers.length)
-  return { customers, total, page, totalPages: Math.max(1, Math.ceil(total / limit)), source: 'platform.contacts' }
+  return { customers, total, page, totalPages: Math.max(1, Math.ceil(total / limit)), source: 'platform.people' }
 }
 
 async function loadPlatformCustomerDetail(capabilities, contactId) {
@@ -2675,7 +2675,7 @@ app.get('/api/:slug/admin/conversations', async (req, res) => {
           count(m.id)::int AS "messageCount",
           max(coalesce(m.created_at, m.received_at)) AS "lastMessageAt"
         FROM conversaflow.conversations AS c
-        LEFT JOIN platform.contacts AS co
+        LEFT JOIN platform.people AS co
           ON co.id = c.contact_id
         LEFT JOIN conversaflow.messages AS m
           ON m.conversation_id = c.id
