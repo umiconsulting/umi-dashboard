@@ -122,15 +122,14 @@ app.post('/api/auth/local/login', async (req, res) => {
   try {
     const rows = await prisma.$queryRaw`
       SELECT
-        c.user_id::text AS "userId",
-        c.password_salt AS "passwordSalt",
-        c.password_hash AS "passwordHash",
+        u.id::text AS "userId",
+        u.password_salt AS "passwordSalt",
+        u.password_hash AS "passwordHash",
         u.email,
         u.display_name AS "displayName"
-      FROM dashboard_compat.local_user_credentials AS c
-      JOIN platform.users AS u
-        ON u.id = c.user_id
-      WHERE lower(c.username) = ${username}
+      FROM platform.users AS u
+      WHERE lower(u.email) = ${username}
+        AND u.password_hash IS NOT NULL
       LIMIT 1
     `
     const credential = rows[0]
@@ -182,8 +181,8 @@ app.post('/api/auth/local/forgot-password', async (req, res) => {
     const rows = await prisma.$queryRaw`
       SELECT u.id::text AS "userId", u.email, u.display_name AS "displayName"
       FROM platform.users AS u
-      JOIN dashboard_compat.local_user_credentials AS c ON c.user_id = u.id
       WHERE lower(u.email) = ${email}
+        AND u.password_hash IS NOT NULL
       LIMIT 1
     `
     // Always respond 200 to avoid user enumeration
@@ -195,7 +194,7 @@ app.post('/api/auth/local/forgot-password', async (req, res) => {
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000) // 15 min
 
     await prisma.$executeRaw`
-      INSERT INTO dashboard_compat.password_reset_tokens (user_id, token_hash, expires_at)
+      INSERT INTO platform.password_reset_tokens (user_id, token_hash, expires_at)
       VALUES (${user.userId}::uuid, ${tokenHash}, ${expiresAt})
     `
 
@@ -236,7 +235,7 @@ app.post('/api/auth/local/reset-password', async (req, res) => {
     const tokenHash = createHash('sha256').update(token).digest('hex')
     const rows = await prisma.$queryRaw`
       SELECT id::text, user_id::text AS "userId", expires_at AS "expiresAt", used_at AS "usedAt"
-      FROM dashboard_compat.password_reset_tokens
+      FROM platform.password_reset_tokens
       WHERE token_hash = ${tokenHash}
       LIMIT 1
     `
@@ -247,12 +246,12 @@ app.post('/api/auth/local/reset-password', async (req, res) => {
 
     const { salt, hash } = hashLocalPassword(password)
     await prisma.$executeRaw`
-      UPDATE dashboard_compat.local_user_credentials
+      UPDATE platform.users
       SET password_salt = ${salt}, password_hash = ${hash}, updated_at = now()
-      WHERE user_id = ${record.userId}::uuid
+      WHERE id = ${record.userId}::uuid
     `
     await prisma.$executeRaw`
-      UPDATE dashboard_compat.password_reset_tokens
+      UPDATE platform.password_reset_tokens
       SET used_at = now()
       WHERE id = ${record.id}::uuid
     `
