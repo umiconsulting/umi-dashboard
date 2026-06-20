@@ -80,7 +80,7 @@ app.post('/api/kds/heartbeat', async (req, res) => {
   const { device_id, device_name, station_id, station_name } = req.body || {}
   if (!device_id) return res.status(400).json({ error: 'device_id required' })
   try {
-    const rows = await prisma.$queryRaw`SELECT is_active FROM kds.device_sessions WHERE id = ${device_id}::uuid LIMIT 1`
+    const rows = await prisma.$queryRaw`SELECT is_active FROM device.sessions WHERE id = ${device_id}::uuid LIMIT 1`
     if (rows[0] && rows[0].is_active !== true) return res.status(403).json(kdsRevokedPayload())
     if (!rows[0]) return res.status(404).json({ error: 'device_session_not_found' })
   } catch (err) {
@@ -127,7 +127,7 @@ app.post('/api/auth/local/login', async (req, res) => {
         u.password_hash AS "passwordHash",
         u.email,
         u.display_name AS "displayName"
-      FROM platform.users AS u
+      FROM core.users AS u
       WHERE lower(u.email) = ${username}
         AND u.password_hash IS NOT NULL
       LIMIT 1
@@ -143,12 +143,12 @@ app.post('/api/auth/local/login', async (req, res) => {
         t.slug,
         t.name,
         array_agg(r.key ORDER BY r.key) FILTER (WHERE r.key IS NOT NULL) AS roles
-      FROM platform.tenant_memberships AS tm
-      JOIN platform.tenants AS t
+      FROM core.tenant_memberships AS tm
+      JOIN core.tenants AS t
         ON t.id = tm.tenant_id
-      LEFT JOIN platform.membership_roles AS mr
+      LEFT JOIN core.membership_roles AS mr
         ON mr.membership_id = tm.id
-      LEFT JOIN platform.roles AS r
+      LEFT JOIN core.roles AS r
         ON r.id = mr.role_id
       WHERE tm.user_id = ${credential.userId}::uuid
         AND tm.status = 'active'
@@ -180,7 +180,7 @@ app.post('/api/auth/local/forgot-password', async (req, res) => {
   try {
     const rows = await prisma.$queryRaw`
       SELECT u.id::text AS "userId", u.email, u.display_name AS "displayName"
-      FROM platform.users AS u
+      FROM core.users AS u
       WHERE lower(u.email) = ${email}
         AND u.password_hash IS NOT NULL
       LIMIT 1
@@ -194,7 +194,7 @@ app.post('/api/auth/local/forgot-password', async (req, res) => {
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000) // 15 min
 
     await prisma.$executeRaw`
-      INSERT INTO platform.password_reset_tokens (user_id, token_hash, expires_at)
+      INSERT INTO core.password_reset_tokens (user_id, token_hash, expires_at)
       VALUES (${user.userId}::uuid, ${tokenHash}, ${expiresAt})
     `
 
@@ -235,7 +235,7 @@ app.post('/api/auth/local/reset-password', async (req, res) => {
     const tokenHash = createHash('sha256').update(token).digest('hex')
     const rows = await prisma.$queryRaw`
       SELECT id::text, user_id::text AS "userId", expires_at AS "expiresAt", used_at AS "usedAt"
-      FROM platform.password_reset_tokens
+      FROM core.password_reset_tokens
       WHERE token_hash = ${tokenHash}
       LIMIT 1
     `
@@ -246,12 +246,12 @@ app.post('/api/auth/local/reset-password', async (req, res) => {
 
     const { salt, hash } = hashLocalPassword(password)
     await prisma.$executeRaw`
-      UPDATE platform.users
+      UPDATE core.users
       SET password_salt = ${salt}, password_hash = ${hash}, updated_at = now()
       WHERE id = ${record.userId}::uuid
     `
     await prisma.$executeRaw`
-      UPDATE platform.password_reset_tokens
+      UPDATE core.password_reset_tokens
       SET used_at = now()
       WHERE id = ${record.id}::uuid
     `
@@ -272,8 +272,40 @@ function fmt(centavos) {
   }).format((centavos ?? 0) / 100)
 }
 
+// Composite "tenant" view for the legacy slug handlers. The canonical schema keeps
+// core.tenants minimal; loyalty/branding/promo live in loyalty.programs (branding jsonb)
+// and ops.businesses. We re-expose them under the field names the handlers expect.
 async function getTenant(slug) {
-  return prisma.tenant.findUnique({ where: { slug } })
+  const rows = await prisma.$queryRaw`
+    SELECT
+      t.id::text,
+      t.slug,
+      t.name,
+      t.timezone,
+      t.status,
+      ob.city,
+      p.id::text                      AS "programId",
+      p.card_prefix                   AS "cardPrefix",
+      p.pass_style                    AS "passStyle",
+      p.self_registration             AS "selfRegistration",
+      p.topup_enabled                 AS "topupEnabled",
+      p.birthday_reward_enabled       AS "birthdayRewardEnabled",
+      p.birthday_reward_name          AS "birthdayRewardName",
+      p.branding->>'primary_color'    AS "primaryColor",
+      p.branding->>'secondary_color'  AS "secondaryColor",
+      p.branding->>'logo_url'         AS "logoUrl",
+      p.branding->>'strip_image_url'  AS "stripImageUrl",
+      p.branding->>'promo_message'    AS "promoMessage",
+      p.branding->>'promo_starts_at'  AS "promoStartsAt",
+      p.branding->>'promo_ends_at'    AS "promoEndsAt",
+      p.branding->>'promo_days'       AS "promoDays"
+    FROM core.tenants AS t
+    LEFT JOIN loyalty.programs AS p  ON p.tenant_id = t.id
+    LEFT JOIN ops.businesses   AS ob ON ob.tenant_id = t.id
+    WHERE t.slug = ${slug}
+    LIMIT 1
+  `
+  return rows[0] || null
 }
 
 async function getTenantById(tenantId) {
@@ -281,7 +313,7 @@ async function getTenantById(tenantId) {
   try {
     const rows = await prisma.$queryRaw`
       SELECT id::text, slug, name, timezone
-      FROM platform.tenants
+      FROM core.tenants
       WHERE id = ${tenantId}::uuid
       LIMIT 1
     `
@@ -301,7 +333,7 @@ async function getLocationForTenant(tenantId, requestedLocationId = null) {
   const rows = requestedLocationId
     ? await prisma.$queryRaw`
         SELECT id::text, slug, name
-        FROM platform.locations
+        FROM core.locations
         WHERE tenant_id = ${tenantId}::uuid
           AND id = ${requestedLocationId}::uuid
           AND status = 'active'
@@ -309,7 +341,7 @@ async function getLocationForTenant(tenantId, requestedLocationId = null) {
       `
     : await prisma.$queryRaw`
         SELECT id::text, slug, name
-        FROM platform.locations
+        FROM core.locations
         WHERE tenant_id = ${tenantId}::uuid
           AND status = 'active'
         ORDER BY
@@ -368,16 +400,16 @@ async function requireTenantAccess(req, res, tenantId) {
       t.timezone,
       array_remove(array_agg(DISTINCT r.key), NULL) AS roles,
       array_remove(array_agg(DISTINCT p.key), NULL) AS permissions
-    FROM platform.tenant_memberships AS tm
-    JOIN platform.tenants AS t
+    FROM core.tenant_memberships AS tm
+    JOIN core.tenants AS t
       ON t.id = tm.tenant_id
-    LEFT JOIN platform.membership_roles AS mr
+    LEFT JOIN core.membership_roles AS mr
       ON mr.membership_id = tm.id
-    LEFT JOIN platform.roles AS r
+    LEFT JOIN core.roles AS r
       ON r.id = mr.role_id
-    LEFT JOIN platform.role_permissions AS rp
+    LEFT JOIN core.role_permissions AS rp
       ON rp.role_id = r.id
-    LEFT JOIN platform.permissions AS p
+    LEFT JOIN core.permissions AS p
       ON p.id = rp.permission_id
     WHERE tm.user_id = ${userId}::uuid
       AND tm.tenant_id = ${tenantId}::uuid
@@ -417,7 +449,7 @@ async function loadProducts(tenantId) {
       status,
       location_id::text AS "locationId",
       config
-    FROM platform.product_instances
+    FROM core.product_instances
     WHERE tenant_id = ${tenantId}::uuid
       AND location_id IS NULL
     ORDER BY product_key
@@ -433,13 +465,15 @@ async function loadProducts(tenantId) {
 }
 
 async function loadLocations(tenantId) {
+  // core.locations has no timezone column — fall back to the tenant timezone.
   return prisma.$queryRaw`
-    SELECT id::text, slug, name, timezone, status
-    FROM platform.locations
-    WHERE tenant_id = ${tenantId}::uuid
+    SELECT l.id::text, l.slug, l.name, t.timezone, l.status
+    FROM core.locations AS l
+    JOIN core.tenants AS t ON t.id = l.tenant_id
+    WHERE l.tenant_id = ${tenantId}::uuid
     ORDER BY
-      CASE WHEN lower(name) = 'chapultepec' THEN 0 ELSE 1 END,
-      created_at ASC
+      CASE WHEN lower(l.name) = 'chapultepec' THEN 0 ELSE 1 END,
+      l.created_at ASC
   `
 }
 
@@ -480,8 +514,8 @@ async function requireProduct(req, res, tenantId, productKey) {
 async function requireLegacyProduct(req, res, productKey) {
   const rows = await prisma.$queryRaw`
     SELECT pi.status
-    FROM platform.tenants AS t
-    LEFT JOIN platform.product_instances AS pi
+    FROM core.tenants AS t
+    LEFT JOIN core.product_instances AS pi
       ON pi.tenant_id = t.id
       AND pi.product_key = ${productKey}
       AND pi.location_id IS NULL
@@ -652,11 +686,11 @@ async function loadPlatformCustomers(capabilities, options = {}) {
     SELECT
       c.id::text,
       c.display_name,
-      c.phone,
-      c.email,
+      c.normalized_phone AS phone,
+      c.normalized_email AS email,
       c.created_at,
       c.updated_at,
-      COALESCE(phone_identity.normalized_value, c.phone) AS normalized_phone,
+      COALESCE(phone_identity.normalized_value, c.normalized_phone) AS normalized_phone,
       COALESCE(identities.items, '[]'::jsonb) AS identities,
       COALESCE(cash_summary.loyalty_count, 0)::int AS loyalty_count,
       COALESCE(cash_summary.total_visits, 0)::int AS total_visits,
@@ -670,30 +704,28 @@ async function loadPlatformCustomers(capabilities, options = {}) {
       COALESCE(quality_summary.data_quality_count, 0)::int AS data_quality_count,
       COALESCE(merge_summary.merge_candidate_count, 0)::int AS merge_candidate_count,
       last_touch.last_touch_at
-    FROM platform.people AS c
+    FROM core.people AS c
     LEFT JOIN LATERAL (
       SELECT ci.normalized_value
-      FROM platform.contact_identities AS ci
+      FROM core.contact_methods AS ci
       WHERE ci.person_id = c.id
-        AND ci.identity_type IN ('phone', 'whatsapp')
+        AND ci.kind IN ('phone', 'whatsapp')
         AND ci.normalized_value IS NOT NULL
-      ORDER BY CASE WHEN ci.identity_type = 'phone' THEN 0 ELSE 1 END, ci.created_at ASC
+      ORDER BY CASE WHEN ci.kind = 'phone' THEN 0 ELSE 1 END, ci.created_at ASC
       LIMIT 1
     ) AS phone_identity ON true
     LEFT JOIN LATERAL (
       SELECT jsonb_agg(
         jsonb_build_object(
           'id', ci.id::text,
-          'identity_type', ci.identity_type,
-          'identity_value', ci.identity_value,
+          'identity_type', ci.kind,
+          'identity_value', ci.display_value,
           'normalized_value', ci.normalized_value,
-          'provider', ci.provider,
-          'verification_status', ci.verification_status,
-          'confidence', ci.confidence
+          'verification_status', CASE WHEN ci.verified_at IS NOT NULL THEN 'verified' ELSE 'unverified' END
         )
-        ORDER BY ci.identity_type, ci.created_at
+        ORDER BY ci.kind, ci.created_at
       ) AS items
-      FROM platform.contact_identities AS ci
+      FROM core.contact_methods AS ci
       WHERE ci.person_id = c.id
     ) AS identities ON true
     LEFT JOIN LATERAL (
@@ -701,19 +733,18 @@ async function loadPlatformCustomers(capabilities, options = {}) {
         count(la.id) AS loyalty_count,
         COALESCE(sum(lc.total_visits), 0) AS total_visits,
         COALESCE(sum(lc.balance_cents), 0) AS wallet_balance_cents,
-        count(gc.id) AS gift_card_count,
+        0 AS gift_card_count,
         max(GREATEST(lc.updated_at, la.updated_at)) AS last_cash_at
-      FROM cash.loyalty_accounts AS la
-      LEFT JOIN cash.loyalty_cards AS lc ON lc.loyalty_account_id = la.id
-      LEFT JOIN cash.gift_cards AS gc ON gc.recipient_person_id = c.id
+      FROM loyalty.accounts AS la
+      LEFT JOIN loyalty.cards AS lc ON lc.account_id = la.id
       WHERE la.person_id = c.id
     ) AS cash_summary ON true
     LEFT JOIN LATERAL (
       SELECT
         count(cv.id) AS conversation_count,
         count(cv.id) FILTER (WHERE cv.status IN ('open', 'pending', 'active')) AS active_conversations,
-        max(cv.updated_at) AS last_conversation_at
-      FROM conversaflow.conversations AS cv
+        max(cv.last_message_at) AS last_conversation_at
+      FROM comms.conversations AS cv
       WHERE cv.person_id = c.id
     ) AS conversation_summary ON true
     LEFT JOIN LATERAL (
@@ -721,24 +752,24 @@ async function loadPlatformCustomers(capabilities, options = {}) {
         count(o.id) AS orders_count,
         COALESCE(sum(o.total_cents), 0) AS total_spend_cents,
         max(COALESCE(o.placed_at, o.created_at)) AS last_order_at
-      FROM commerce.orders AS o
+      FROM ops.orders AS o
       WHERE o.person_id = c.id
     ) AS order_summary ON true
     LEFT JOIN LATERAL (
       SELECT count(mi.id) AS memory_count, max(mi.updated_at) AS last_memory_at
-      FROM conversaflow.memory_items AS mi
+      FROM comms.memory_items AS mi
       WHERE mi.person_id = c.id
     ) AS memory_summary ON true
     LEFT JOIN LATERAL (
       SELECT count(dq.id) AS data_quality_count, max(dq.created_at) AS last_quality_at
       FROM observability.data_quality_findings AS dq
       WHERE dq.tenant_id = c.tenant_id
-        AND dq.status = 'open'
+        AND dq.resolved_at IS NULL
         AND dq.subject_id = c.id::text
     ) AS quality_summary ON true
     LEFT JOIN LATERAL (
       SELECT count(mc.id) AS merge_candidate_count, max(mc.created_at) AS last_merge_at
-      FROM platform.contact_merge_candidates AS mc
+      FROM core.contact_merge_candidates AS mc
       WHERE mc.tenant_id = c.tenant_id
         AND mc.confidence IN ('candidate', 'high')
         AND (mc.left_person_id = c.id OR mc.right_person_id = c.id)
@@ -767,8 +798,8 @@ async function loadPlatformCustomers(capabilities, options = {}) {
       AND (
         ${search} = ''
         OR c.display_name ILIKE ${`%${search}%`}
-        OR c.phone ILIKE ${`%${search}%`}
-        OR c.email ILIKE ${`%${search}%`}
+        OR c.normalized_phone ILIKE ${`%${search}%`}
+        OR c.normalized_email ILIKE ${`%${search}%`}
         OR phone_identity.normalized_value ILIKE ${`%${search}%`}
       )
     ORDER BY last_touch.last_touch_at DESC NULLS LAST, c.created_at DESC
@@ -777,12 +808,12 @@ async function loadPlatformCustomers(capabilities, options = {}) {
   `
   const countRows = await prisma.$queryRaw`
     SELECT count(*)::int AS count
-    FROM platform.people AS c
+    FROM core.people AS c
     LEFT JOIN LATERAL (
       SELECT ci.normalized_value
-      FROM platform.contact_identities AS ci
+      FROM core.contact_methods AS ci
       WHERE ci.person_id = c.id
-        AND ci.identity_type IN ('phone', 'whatsapp')
+        AND ci.kind IN ('phone', 'whatsapp')
         AND ci.normalized_value IS NOT NULL
       LIMIT 1
     ) AS phone_identity ON true
@@ -790,25 +821,25 @@ async function loadPlatformCustomers(capabilities, options = {}) {
       AND (${contactId} = '' OR c.id = ${contactUuid}::uuid)
       AND (
         ${filter} = ''
-        OR (${filter} = 'whatsapp' AND EXISTS (SELECT 1 FROM conversaflow.conversations AS cv WHERE cv.person_id = c.id))
-        OR (${filter} = 'cash' AND EXISTS (SELECT 1 FROM cash.loyalty_accounts AS la WHERE la.person_id = c.id))
-        OR (${filter} = 'memory' AND EXISTS (SELECT 1 FROM conversaflow.memory_items AS mi WHERE mi.person_id = c.id))
+        OR (${filter} = 'whatsapp' AND EXISTS (SELECT 1 FROM comms.conversations AS cv WHERE cv.person_id = c.id))
+        OR (${filter} = 'cash' AND EXISTS (SELECT 1 FROM loyalty.accounts AS la WHERE la.person_id = c.id))
+        OR (${filter} = 'memory' AND EXISTS (SELECT 1 FROM comms.memory_items AS mi WHERE mi.person_id = c.id))
         OR (${filter} = 'review' AND (
-          EXISTS (SELECT 1 FROM observability.data_quality_findings AS dq WHERE dq.tenant_id = c.tenant_id AND dq.status = 'open' AND dq.subject_id = c.id::text)
-          OR EXISTS (SELECT 1 FROM platform.contact_merge_candidates AS mc WHERE mc.tenant_id = c.tenant_id AND mc.confidence IN ('candidate', 'high') AND (mc.left_person_id = c.id OR mc.right_person_id = c.id))
+          EXISTS (SELECT 1 FROM observability.data_quality_findings AS dq WHERE dq.tenant_id = c.tenant_id AND dq.resolved_at IS NULL AND dq.subject_id = c.id::text)
+          OR EXISTS (SELECT 1 FROM core.contact_merge_candidates AS mc WHERE mc.tenant_id = c.tenant_id AND mc.confidence IN ('candidate', 'high') AND (mc.left_person_id = c.id OR mc.right_person_id = c.id))
         ))
       )
       AND (
         ${search} = ''
         OR c.display_name ILIKE ${`%${search}%`}
-        OR c.phone ILIKE ${`%${search}%`}
-        OR c.email ILIKE ${`%${search}%`}
+        OR c.normalized_phone ILIKE ${`%${search}%`}
+        OR c.normalized_email ILIKE ${`%${search}%`}
         OR phone_identity.normalized_value ILIKE ${`%${search}%`}
       )
   `
   const customers = rows.map((row) => platformCustomerDto(row, capabilities))
   const total = Number(countRows[0]?.count || customers.length)
-  return { customers, total, page, totalPages: Math.max(1, Math.ceil(total / limit)), source: 'platform.people' }
+  return { customers, total, page, totalPages: Math.max(1, Math.ceil(total / limit)), source: 'core.people' }
 }
 
 async function loadPlatformCustomerDetail(capabilities, contactId) {
@@ -829,19 +860,20 @@ async function loadPlatformCustomerDetail(capabilities, contactId) {
 async function loadPlatformCustomerTimeline(capabilities, contactId) {
   const rows = await prisma.$queryRaw`
     SELECT * FROM (
-      SELECT 'whatsapp_message' AS type, m.id::text AS id, m.created_at AS occurred_at, m.role AS label, COALESCE(m.body, m.payload->>'content', '') AS detail, 'conversaflow' AS product
-      FROM conversaflow.messages AS m
-      WHERE m.person_id = ${contactId}::uuid AND m.tenant_id = ${capabilities.tenant.id}::uuid
+      SELECT 'whatsapp_message' AS type, m.id::text AS id, m.created_at AS occurred_at, m.role AS label, COALESCE(m.content, '') AS detail, 'conversaflow' AS product
+      FROM comms.messages AS m
+      JOIN comms.conversations AS cv ON cv.id = m.conversation_id
+      WHERE cv.person_id = ${contactId}::uuid AND m.tenant_id = ${capabilities.tenant.id}::uuid
       UNION ALL
-      SELECT 'order' AS type, o.id::text AS id, COALESCE(o.placed_at, o.created_at) AS occurred_at, o.status AS label, COALESCE(o.order_number, o.source_ref, o.id::text) AS detail, 'orders' AS product
-      FROM commerce.orders AS o
+      SELECT 'order' AS type, o.id::text AS id, COALESCE(o.placed_at, o.created_at) AS occurred_at, o.status AS label, COALESCE(o.source_transaction_id, o.id::text) AS detail, 'orders' AS product
+      FROM ops.orders AS o
       WHERE o.person_id = ${contactId}::uuid AND o.tenant_id = ${capabilities.tenant.id}::uuid
       UNION ALL
-      SELECT 'memory' AS type, mi.id::text AS id, mi.updated_at AS occurred_at, mi.memory_type AS label, COALESCE(mi.value->>'content', mi.value::text, '') AS detail, 'conversaflow' AS product
-      FROM conversaflow.memory_items AS mi
+      SELECT 'memory' AS type, mi.id::text AS id, mi.updated_at AS occurred_at, mi.memory_type AS label, COALESCE(mi.content, '') AS detail, 'conversaflow' AS product
+      FROM comms.memory_items AS mi
       WHERE mi.person_id = ${contactId}::uuid AND mi.tenant_id = ${capabilities.tenant.id}::uuid
       UNION ALL
-      SELECT 'data_quality' AS type, dq.id::text AS id, dq.created_at AS occurred_at, dq.severity AS label, dq.finding_key AS detail, 'data' AS product
+      SELECT 'data_quality' AS type, dq.id::text AS id, dq.created_at AS occurred_at, dq.severity AS label, dq.check_name AS detail, 'data' AS product
       FROM observability.data_quality_findings AS dq
       WHERE dq.tenant_id = ${capabilities.tenant.id}::uuid AND dq.subject_id = ${contactId}
     ) AS timeline
@@ -856,18 +888,18 @@ async function loadPlatformCustomerConversations(capabilities, contactId) {
     SELECT
       cv.id::text,
       cv.status,
-      cv.opened_at,
-      cv.closed_at,
-      cv.updated_at,
+      cv.created_at AS opened_at,
+      NULL::timestamptz AS closed_at,
+      cv.last_message_at AS updated_at,
       cv.metadata,
       count(m.id)::int AS "messageCount",
       max(m.created_at) AS "lastMessageAt"
-    FROM conversaflow.conversations AS cv
-    LEFT JOIN conversaflow.messages AS m ON m.conversation_id = cv.id
+    FROM comms.conversations AS cv
+    LEFT JOIN comms.messages AS m ON m.conversation_id = cv.id
     WHERE cv.person_id = ${contactId}::uuid
       AND cv.tenant_id = ${capabilities.tenant.id}::uuid
     GROUP BY cv.id
-    ORDER BY cv.updated_at DESC
+    ORDER BY cv.last_message_at DESC NULLS LAST
     LIMIT 40
   `
   return rows.map((row) => ({
@@ -886,15 +918,15 @@ async function loadPlatformCustomerOrders(capabilities, contactId) {
   const rows = await prisma.$queryRaw`
     SELECT
       id::text,
-      order_number,
-      source_product,
+      source_transaction_id AS order_number,
+      source AS source_product,
       status,
       channel,
       total_cents,
       placed_at,
       created_at,
       updated_at
-    FROM commerce.orders
+    FROM ops.orders
     WHERE person_id = ${contactId}::uuid
       AND tenant_id = ${capabilities.tenant.id}::uuid
     ORDER BY COALESCE(placed_at, created_at) DESC
@@ -926,8 +958,8 @@ async function loadPlatformCustomerCash(capabilities, contactId) {
       lc.pending_rewards,
       lc.created_at,
       lc.updated_at
-    FROM cash.loyalty_accounts AS la
-    LEFT JOIN cash.loyalty_cards AS lc ON lc.loyalty_account_id = la.id
+    FROM loyalty.accounts AS la
+    LEFT JOIN loyalty.cards AS lc ON lc.account_id = la.id
     WHERE la.person_id = ${contactId}::uuid
       AND la.tenant_id = ${capabilities.tenant.id}::uuid
     ORDER BY la.created_at DESC
@@ -957,22 +989,25 @@ async function loadPlatformCustomerCash(capabilities, contactId) {
 async function loadPlatformCustomerIdentity(capabilities, contactId) {
   const [identities, candidates, findings] = await Promise.all([
     prisma.$queryRaw`
-      SELECT id::text, identity_type, identity_value, normalized_value, provider, verification_status, confidence, metadata, created_at
-      FROM platform.contact_identities
+      SELECT id::text, kind AS identity_type, display_value AS identity_value, normalized_value,
+             (verified_at IS NOT NULL) AS verification_status, metadata, created_at
+      FROM core.contact_methods
       WHERE person_id = ${contactId}::uuid
         AND tenant_id = ${capabilities.tenant.id}::uuid
-      ORDER BY identity_type, created_at
+      ORDER BY kind, created_at
     `,
     prisma.$queryRaw`
       SELECT id::text, left_person_id::text, right_person_id::text, match_type, confidence, detail, created_at, resolved_at
-      FROM platform.contact_merge_candidates
+      FROM core.contact_merge_candidates
       WHERE tenant_id = ${capabilities.tenant.id}::uuid
         AND (left_person_id = ${contactId}::uuid OR right_person_id = ${contactId}::uuid)
       ORDER BY created_at DESC
       LIMIT 20
     `,
     prisma.$queryRaw`
-      SELECT id::text, severity, finding_key, detail, status, created_at, resolved_at
+      SELECT id::text, severity, check_name AS finding_key, detail,
+             CASE WHEN resolved_at IS NULL THEN 'open' ELSE 'resolved' END AS status,
+             created_at, resolved_at
       FROM observability.data_quality_findings
       WHERE tenant_id = ${capabilities.tenant.id}::uuid
         AND subject_id = ${contactId}
@@ -1046,7 +1081,7 @@ async function verifyLocalKdsDevice(req) {
 
   const rows = await prisma.$queryRaw`
     SELECT *
-    FROM kds.device_sessions
+    FROM device.sessions
     WHERE token_hash = ${_sha256Hex(token)}
     LIMIT 1
   `
@@ -1060,8 +1095,8 @@ async function verifyLocalKdsDevice(req) {
 
   const deviceId = String(row.id || row.device_id)
   await prisma.$executeRaw`
-    UPDATE kds.device_sessions
-    SET last_seen_at = now()
+    UPDATE device.sessions
+    SET last_used_at = now()
     WHERE id = ${deviceId}::uuid
   `
 
@@ -1115,13 +1150,13 @@ app.post('/api/kds/board', async (req, res) => {
           t.id::text AS source_transaction_id,
           t.tenant_id::text AS business_id,
           'whatsapp'::text AS source_channel,
-          t.status::text,
+          t.kitchen_status::text AS status,
           t.station_id::text,
-          s.name AS station_name,
-          t.customer_name,
-          t.customer_phone,
+          t.station_name AS station_name,
+          t.pickup_person AS customer_name,
+          NULL::text AS customer_phone,
           NULL::text AS pickup_person,
-          t.customer_note,
+          t.notes AS customer_note,
           NULL::text AS cancellation_reason,
           NULL::text AS partial_cancellation_reason,
           (t.total_cents::numeric / 100.0) AS total_amount,
@@ -1144,16 +1179,13 @@ app.post('/api/kds/board', async (req, res) => {
             ) FILTER (WHERE i.id IS NOT NULL),
             '[]'::jsonb
           ) AS items
-        FROM kds.tickets AS t
-        LEFT JOIN kds.stations AS s
-          ON s.id = t.station_id
-        LEFT JOIN kds.ticket_items AS i
-          ON i.ticket_id = t.id
+        FROM ops.orders AS t
+        LEFT JOIN ops.order_items AS i
+          ON i.order_id = t.id
         WHERE t.tenant_id = ${device.tenantId}::uuid
           AND (${device.locationId}::uuid IS NULL OR t.location_id IS NOT DISTINCT FROM ${device.locationId}::uuid)
-          AND (${device.stationId}::uuid IS NULL OR t.station_id IS NOT DISTINCT FROM ${device.stationId}::uuid OR t.station_id IS NULL)
-          AND t.status::text IN ('new', 'accepted', 'preparing', 'ready', 'partial_cancelled')
-        GROUP BY t.id, s.id
+          AND t.kitchen_status::text IN ('new', 'accepted', 'preparing', 'ready', 'partial_cancelled')
+        GROUP BY t.id
         ORDER BY t.created_at ASC
         LIMIT 200
       `
@@ -1180,13 +1212,13 @@ app.post('/api/kds/command', async (req, res) => {
       }
 
       const rows = await prisma.$queryRaw`
-        UPDATE kds.tickets
-        SET status = ${targetStatus}, updated_at = now()
+        UPDATE ops.orders
+        SET kitchen_status = , updated_at = now()
         WHERE id = ${ticketId}::uuid
           AND tenant_id = ${device.tenantId}::uuid
           AND (${device.locationId}::uuid IS NULL OR location_id IS NOT DISTINCT FROM ${device.locationId}::uuid)
-          AND (${device.stationId}::uuid IS NULL OR station_id IS NOT DISTINCT FROM ${device.stationId}::uuid OR station_id IS NULL)
-        RETURNING id::text AS ticket_id, status
+          AND (${device.stationId} IS NULL OR station_id IS NOT DISTINCT FROM ${device.stationId} OR station_id IS NULL)
+        RETURNING id::text AS ticket_id, kitchen_status AS status
       `
       if (!rows[0]) return res.status(404).json({ error: 'Ticket not found' })
       return res.json({ ok: true, data: rows[0] })
@@ -1200,27 +1232,27 @@ app.post('/api/kds/command', async (req, res) => {
       {
         const [, rows] = await prisma.$transaction([
           prisma.$executeRaw`
-            UPDATE kds.ticket_items
+            UPDATE ops.order_items
             SET is_cancelled = true
-            WHERE ticket_id = ${ticketId}::uuid
+            WHERE order_id = ${ticketId}::uuid
               AND id IN (${Prisma.join(itemIds.map((id) => Prisma.sql`${String(id)}::uuid`))})
               AND EXISTS (
                 SELECT 1
-                FROM kds.tickets AS t
-                WHERE t.id = kds.ticket_items.ticket_id
+                FROM ops.orders AS t
+                WHERE t.id = ops.order_items.order_id
                   AND t.tenant_id = ${device.tenantId}::uuid
                   AND (${device.locationId}::uuid IS NULL OR t.location_id IS NOT DISTINCT FROM ${device.locationId}::uuid)
-                  AND (${device.stationId}::uuid IS NULL OR t.station_id IS NOT DISTINCT FROM ${device.stationId}::uuid OR t.station_id IS NULL)
+                  AND (${device.stationId} IS NULL OR t.station_id IS NOT DISTINCT FROM ${device.stationId} OR t.station_id IS NULL)
               )
           `,
           prisma.$queryRaw`
-            UPDATE kds.tickets
-            SET status = 'partial_cancelled', updated_at = now()
+            UPDATE ops.orders
+            SET kitchen_status = 'partial_cancelled', updated_at = now()
             WHERE id = ${ticketId}::uuid
               AND tenant_id = ${device.tenantId}::uuid
               AND (${device.locationId}::uuid IS NULL OR location_id IS NOT DISTINCT FROM ${device.locationId}::uuid)
-              AND (${device.stationId}::uuid IS NULL OR station_id IS NOT DISTINCT FROM ${device.stationId}::uuid OR station_id IS NULL)
-            RETURNING id::text AS ticket_id, status
+              AND (${device.stationId} IS NULL OR station_id IS NOT DISTINCT FROM ${device.stationId} OR station_id IS NULL)
+            RETURNING id::text AS ticket_id, kitchen_status AS status
           `,
         ])
         if (!rows[0]) return res.status(404).json({ error: 'Ticket not found' })
@@ -1247,12 +1279,12 @@ app.get('/api/me/tenants', async (req, res) => {
         t.name,
         t.timezone,
         array_remove(array_agg(DISTINCT r.key), NULL) AS roles
-      FROM platform.tenant_memberships AS tm
-      JOIN platform.tenants AS t
+      FROM core.tenant_memberships AS tm
+      JOIN core.tenants AS t
         ON t.id = tm.tenant_id
-      LEFT JOIN platform.membership_roles AS mr
+      LEFT JOIN core.membership_roles AS mr
         ON mr.membership_id = tm.id
-      LEFT JOIN platform.roles AS r
+      LEFT JOIN core.roles AS r
         ON r.id = mr.role_id
       WHERE tm.user_id = ${userId}::uuid
         AND tm.status = 'active'
@@ -1306,7 +1338,7 @@ app.patch('/api/tenants/:tenantId/settings', async (req, res) => {
     if (!capabilities) return null
     const d = req.body || {}
     await prisma.$executeRaw`
-      UPDATE platform.tenants
+      UPDATE core.tenants
       SET
         name = CASE WHEN ${d.name !== undefined} THEN ${d.name} ELSE name END,
         timezone = CASE WHEN ${d.timezone !== undefined} THEN ${d.timezone} ELSE timezone END,
@@ -1339,7 +1371,7 @@ app.patch('/api/tenants/:tenantId/locations/:locationId', async (req, res) => {
     if (!location) return null
     const d = req.body || {}
     const rows = await prisma.$queryRaw`
-      UPDATE platform.locations
+      UPDATE core.locations
       SET
         name = CASE WHEN ${d.name !== undefined} THEN ${d.name} ELSE name END,
         timezone = CASE WHEN ${d.timezone !== undefined} THEN ${d.timezone} ELSE timezone END,
@@ -1626,8 +1658,8 @@ app.get('/api/:slug/admin/settings', async (req, res) => {
       stripImageUrl:         tenant.stripImageUrl,
       passStyle:             tenant.passStyle,
       promoMessage:          tenant.promoMessage,
-      promoStartsAt:         tenant.promoStartsAt?.toISOString() ?? null,
-      promoEndsAt:           tenant.promoEndsAt?.toISOString()   ?? null,
+      promoStartsAt:         tenant.promoStartsAt ?? null,
+      promoEndsAt:           tenant.promoEndsAt   ?? null,
       promoDays:             tenant.promoDays,
       selfRegistration:      tenant.selfRegistration,
       birthdayRewardEnabled: tenant.birthdayRewardEnabled,
@@ -1649,7 +1681,7 @@ app.patch('/api/:slug/admin/settings', async (req, res) => {
     {
       if (d.name !== undefined) {
         await prisma.$executeRaw`
-          UPDATE platform.tenants
+          UPDATE core.tenants
           SET name = ${d.name}, updated_at = now()
           WHERE id = ${tenant.id}::uuid
         `
@@ -1683,7 +1715,7 @@ app.patch('/api/:slug/admin/settings', async (req, res) => {
 
       if (updatesProgram) {
         await prisma.$executeRaw`
-          UPDATE cash.wallet_programs
+          UPDATE loyalty.programs
           SET
             card_prefix = CASE WHEN ${d.cardPrefix !== undefined} THEN ${d.cardPrefix} ELSE card_prefix END,
             pass_style = CASE WHEN ${d.passStyle !== undefined} THEN ${d.passStyle} ELSE pass_style END,
@@ -1710,25 +1742,24 @@ app.get('/api/:slug/admin/stats', async (req, res) => {
     const dayStart = new Date()
     dayStart.setHours(0, 0, 0, 0)
 
-    const [visitsToday, topupsToday, pendingRewards] = await Promise.all([
-      prisma.visit.count({
-        where: { card: { tenantId: tenant.id }, scannedAt: { gte: dayStart } },
-      }),
-      prisma.transaction.aggregate({
-        where: { card: { tenantId: tenant.id }, type: 'TOPUP', createdAt: { gte: dayStart } },
-        _sum: { amountCentavos: true }, _count: true,
-      }),
-      prisma.loyaltyCard.aggregate({
-        where: { tenantId: tenant.id, pendingRewards: { gt: 0 } },
-        _sum: { pendingRewards: true },
-      }),
+    const [visitsRow, topupsRow, pendingRow] = await Promise.all([
+      prisma.$queryRaw`
+        SELECT count(*)::int AS n FROM loyalty.visit_events
+        WHERE tenant_id = ${tenant.id}::uuid AND occurred_at >= ${dayStart}`,
+      prisma.$queryRaw`
+        SELECT count(*)::int AS n, COALESCE(sum(amount_cents), 0)::bigint AS sum
+        FROM loyalty.wallet_transactions
+        WHERE tenant_id = ${tenant.id}::uuid AND type = 'TOPUP' AND created_at >= ${dayStart}`,
+      prisma.$queryRaw`
+        SELECT COALESCE(sum(pending_rewards), 0)::int AS sum FROM loyalty.cards
+        WHERE tenant_id = ${tenant.id}::uuid AND pending_rewards > 0`,
     ])
 
     return res.json({
-      visitsToday,
-      topupsTodayCount: topupsToday._count,
-      topupsTodayMXN:   fmt(topupsToday._sum.amountCentavos ?? 0),
-      pendingRewards:   pendingRewards._sum.pendingRewards ?? 0,
+      visitsToday:      Number(visitsRow[0]?.n ?? 0),
+      topupsTodayCount: Number(topupsRow[0]?.n ?? 0),
+      topupsTodayMXN:   fmt(Number(topupsRow[0]?.sum ?? 0)),
+      pendingRewards:   Number(pendingRow[0]?.sum ?? 0),
     })
   } catch (err) {
     return res.status(500).json({ error: err.message })
@@ -1749,26 +1780,53 @@ app.get('/api/:slug/admin/analytics', async (req, res) => {
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1)
 
     const [
-      recentVisits, topCards, recentUsers, allCards,
-      topupsThisMonth, rewardsThisMonth, activeCustomersLast30,
-      totalCustomers, totalPurchasesAgg, allVisitsSums, activeRewardConfig,
+      recentVisits, topCards, recentUsers, balanceRow,
+      topupsRow, rewardsRow, activeRow, totalsRow, activeRewardConfigRow,
     ] = await Promise.all([
-      prisma.visit.findMany({ where: { card: { tenantId: tenant.id }, scannedAt: { gte: thirtyDaysAgo } }, select: { scannedAt: true } }),
-      prisma.loyaltyCard.findMany({ where: { tenantId: tenant.id }, orderBy: { totalVisits: 'desc' }, take: 10, include: { user: { select: { id: true, name: true } } } }),
-      prisma.user.findMany({ where: { tenantId: tenant.id, role: 'CUSTOMER', createdAt: { gte: eightWeeksAgo } }, select: { createdAt: true } }),
-      prisma.loyaltyCard.findMany({ where: { tenantId: tenant.id }, select: { balanceCentavos: true } }),
-      prisma.transaction.aggregate({ where: { card: { tenantId: tenant.id }, type: 'TOPUP', createdAt: { gte: monthStart } }, _sum: { amountCentavos: true } }),
-      prisma.rewardRedemption.count({ where: { card: { tenantId: tenant.id }, redeemedAt: { gte: monthStart } } }),
-      prisma.visit.findMany({ where: { card: { tenantId: tenant.id }, scannedAt: { gte: thirtyDaysAgo } }, select: { cardId: true }, distinct: ['cardId'] }),
-      prisma.user.count({ where: { tenantId: tenant.id, role: 'CUSTOMER' } }),
-      prisma.transaction.aggregate({ where: { card: { tenantId: tenant.id }, type: 'PURCHASE' }, _sum: { amountCentavos: true } }),
-      prisma.loyaltyCard.aggregate({ where: { tenantId: tenant.id }, _sum: { totalVisits: true } }),
-      prisma.rewardConfig.findFirst({ where: { tenantId: tenant.id, isActive: true }, orderBy: { activatedAt: 'desc' } }),
+      prisma.$queryRaw`
+        SELECT occurred_at AS "scannedAt" FROM loyalty.visit_events
+        WHERE tenant_id = ${tenant.id}::uuid AND occurred_at >= ${thirtyDaysAgo}`,
+      prisma.$queryRaw`
+        SELECT a.person_id::text AS "userId", pe.display_name AS name,
+               c.card_number AS "cardNumber", c.total_visits AS "totalVisits",
+               c.balance_cents AS "balanceCentavos"
+        FROM loyalty.cards AS c
+        JOIN loyalty.accounts AS a ON a.id = c.account_id
+        LEFT JOIN core.people AS pe ON pe.id = a.person_id
+        WHERE c.tenant_id = ${tenant.id}::uuid
+        ORDER BY c.total_visits DESC NULLS LAST LIMIT 10`,
+      prisma.$queryRaw`
+        SELECT created_at AS "createdAt" FROM core.people
+        WHERE tenant_id = ${tenant.id}::uuid AND created_at >= ${eightWeeksAgo}`,
+      prisma.$queryRaw`
+        SELECT COALESCE(sum(balance_cents), 0)::bigint AS sum FROM loyalty.cards
+        WHERE tenant_id = ${tenant.id}::uuid`,
+      prisma.$queryRaw`
+        SELECT COALESCE(sum(amount_cents), 0)::bigint AS sum FROM loyalty.wallet_transactions
+        WHERE tenant_id = ${tenant.id}::uuid AND type = 'TOPUP' AND created_at >= ${monthStart}`,
+      prisma.$queryRaw`
+        SELECT count(*)::int AS n FROM loyalty.reward_redemptions
+        WHERE tenant_id = ${tenant.id}::uuid AND redeemed_at >= ${monthStart}`,
+      prisma.$queryRaw`
+        SELECT count(DISTINCT loyalty_card_id)::int AS n FROM loyalty.visit_events
+        WHERE tenant_id = ${tenant.id}::uuid AND occurred_at >= ${thirtyDaysAgo}`,
+      prisma.$queryRaw`
+        SELECT
+          (SELECT count(*)::int FROM core.people WHERE tenant_id = ${tenant.id}::uuid) AS "totalCustomers",
+          (SELECT COALESCE(sum(abs(amount_cents)), 0)::bigint FROM loyalty.wallet_transactions
+             WHERE tenant_id = ${tenant.id}::uuid AND type = 'PURCHASE') AS "totalRevenueCentavos",
+          (SELECT COALESCE(sum(total_visits), 0)::bigint FROM loyalty.cards
+             WHERE tenant_id = ${tenant.id}::uuid) AS "totalAllTimeVisits"`,
+      prisma.$queryRaw`
+        SELECT visits_required AS "visitsRequired", reward_cost_cents AS "rewardCostCentavos"
+        FROM loyalty.reward_configs
+        WHERE tenant_id = ${tenant.id}::uuid AND is_active = true
+        ORDER BY activated_at DESC NULLS LAST LIMIT 1`,
     ])
 
     const visitCountByDay = {}
     for (const v of recentVisits) {
-      const ds = v.scannedAt.toISOString().slice(0, 10)
+      const ds = new Date(v.scannedAt).toISOString().slice(0, 10)
       visitCountByDay[ds] = (visitCountByDay[ds] ?? 0) + 1
     }
     const visitsByDay = []
@@ -1779,8 +1837,8 @@ app.get('/api/:slug/admin/analytics', async (req, res) => {
     }
 
     const topCustomers = topCards.map(c => ({
-      id: c.userId, name: c.user?.name ?? 'Sin nombre',
-      cardNumber: c.cardNumber, totalVisits: c.totalVisits, balanceMXN: fmt(c.balanceCentavos),
+      id: c.userId, name: c.name ?? 'Sin nombre',
+      cardNumber: c.cardNumber, totalVisits: Number(c.totalVisits ?? 0), balanceMXN: fmt(Number(c.balanceCentavos ?? 0)),
     }))
 
     const MONTHS = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic']
@@ -1794,18 +1852,20 @@ app.get('/api/:slug/admin/analytics', async (req, res) => {
     }
     const newCustomersByWeek = weekBuckets.map(({ weekStart, label }, idx) => {
       const next = idx < weekBuckets.length - 1 ? weekBuckets[idx + 1].weekStart : new Date(now.getTime() + 86400000)
-      const count = recentUsers.filter(u => u.createdAt >= weekStart && u.createdAt < next).length
+      const count = recentUsers.filter(u => new Date(u.createdAt) >= weekStart && new Date(u.createdAt) < next).length
       return { week: label, count }
     })
 
-    const totalBalanceCentavos = allCards.reduce((s, c) => s + c.balanceCentavos, 0)
-    const trueAvg     = totalCustomers > 0 ? Math.round(((allVisitsSums._sum.totalVisits ?? 0) / totalCustomers) * 10) / 10 : 0
-    const retentionRate = totalCustomers > 0 ? Math.round((activeCustomersLast30.length / totalCustomers) * 100) : 0
-    const totalRevenueCentavos = Math.abs(totalPurchasesAgg._sum.amountCentavos ?? 0)
-    const totalAllTimeVisits   = allVisitsSums._sum.totalVisits ?? 0
+    const totalCustomers       = Number(totalsRow[0]?.totalCustomers ?? 0)
+    const totalBalanceCentavos = Number(balanceRow[0]?.sum ?? 0)
+    const totalAllTimeVisits   = Number(totalsRow[0]?.totalAllTimeVisits ?? 0)
+    const activeCustomersLast30 = Number(activeRow[0]?.n ?? 0)
+    const trueAvg     = totalCustomers > 0 ? Math.round((totalAllTimeVisits / totalCustomers) * 10) / 10 : 0
+    const retentionRate = totalCustomers > 0 ? Math.round((activeCustomersLast30 / totalCustomers) * 100) : 0
+    const totalRevenueCentavos = Math.abs(Number(totalsRow[0]?.totalRevenueCentavos ?? 0))
     const avgTicketCentavos    = totalAllTimeVisits > 0 ? Math.round(totalRevenueCentavos / totalAllTimeVisits) : 0
-    const visitsRequired       = activeRewardConfig?.visitsRequired ?? 10
-    const rewardCostCentavos   = activeRewardConfig?.rewardCostCentavos ?? 0
+    const visitsRequired       = Number(activeRewardConfigRow[0]?.visitsRequired ?? 10)
+    const rewardCostCentavos   = Number(activeRewardConfigRow[0]?.rewardCostCentavos ?? 0)
     const revenuePerCycle      = avgTicketCentavos * visitsRequired
     const marginPerCycle       = revenuePerCycle - rewardCostCentavos
     const marginPercent        = revenuePerCycle > 0 ? Math.round((marginPerCycle / revenuePerCycle) * 100) : null
@@ -1813,8 +1873,8 @@ app.get('/api/:slug/admin/analytics', async (req, res) => {
     return res.json({
       visitsByDay, topCustomers, newCustomersByWeek,
       totalBalance:             fmt(totalBalanceCentavos),
-      topupsThisMonth:          fmt(topupsThisMonth._sum.amountCentavos ?? 0),
-      rewardsRedeemedThisMonth: rewardsThisMonth,
+      topupsThisMonth:          fmt(Number(topupsRow[0]?.sum ?? 0)),
+      rewardsRedeemedThisMonth: Number(rewardsRow[0]?.n ?? 0),
       avgVisitsPerCustomer:     trueAvg,
       retentionRate,
       profitability: {
@@ -1842,69 +1902,81 @@ app.get('/api/:slug/admin/customers', async (req, res) => {
     const search = (req.query.search || '').trim().slice(0, 50)
     const sort   = req.query.sort || 'recent'
     const skip   = (page - 1) * limit
+    const like   = `%${search}%`
 
-    const where = search
-      ? { tenantId: tenant.id, role: 'CUSTOMER', OR: [
-          { name: { contains: search } }, { phone: { contains: search } },
-          { email: { contains: search } }, { card: { cardNumber: { contains: search } } },
-        ] }
-      : { tenantId: tenant.id, role: 'CUSTOMER' }
+    // Customers are core.people; their loyalty card resolves via loyalty.accounts → loyalty.cards.
+    const orderSql =
+      sort === 'visits'   ? Prisma.sql`c.total_visits DESC NULLS LAST`
+      : sort === 'balance'  ? Prisma.sql`c.balance_cents DESC NULLS LAST`
+      : sort === 'inactive' ? Prisma.sql`lv.last_visit ASC NULLS FIRST`
+      : sort === 'ltv'      ? Prisma.sql`ltv.ltv_centavos DESC NULLS LAST`
+      : Prisma.sql`pe.created_at DESC`
 
-    const purchaseInclude = {
-      visits:       { orderBy: { scannedAt: 'desc' }, take: 1 },
-      transactions: { where: { type: 'PURCHASE' }, select: { amountCentavos: true } },
-    }
+    const searchSql = Prisma.sql`(
+      ${search} = ''
+      OR pe.display_name    ILIKE ${like}
+      OR pe.normalized_phone ILIKE ${like}
+      OR pe.normalized_email ILIKE ${like}
+      OR c.card_number       ILIKE ${like}
+    )`
 
-    const toCustomer = u => {
-      const ltvCentavos = (u.card?.transactions ?? []).reduce((s, t) => s + Math.abs(t.amountCentavos), 0)
-      return {
-        id: u.id, name: u.name, phone: u.phone, email: u.email,
-        cardNumber:      u.card?.cardNumber   ?? '',
-        cardId:          u.card?.id           ?? '',
-        balanceMXN:      fmt(u.card?.balanceCentavos ?? 0),
-        balanceCentavos: u.card?.balanceCentavos ?? 0,
-        totalVisits:     u.card?.totalVisits     ?? 0,
-        visitsThisCycle: u.card?.visitsThisCycle ?? 0,
-        pendingRewards:  u.card?.pendingRewards  ?? 0,
-        lastVisit:       u.card?.visits[0]?.scannedAt?.toISOString() ?? null,
-        createdAt:       u.createdAt.toISOString(),
-        ltvCentavos, ltvMXN: fmt(ltvCentavos),
-      }
-    }
-
-    if (sort === 'inactive' || sort === 'ltv') {
-      const [allUsers, total] = await Promise.all([
-        prisma.user.findMany({ where, include: { card: { include: purchaseInclude } } }),
-        prisma.user.count({ where }),
-      ])
-      if (sort === 'inactive') {
-        allUsers.sort((a, b) => {
-          const ad = a.card?.visits[0]?.scannedAt ?? null
-          const bd = b.card?.visits[0]?.scannedAt ?? null
-          if (!ad && !bd) return 0; if (!ad) return -1; if (!bd) return 1
-          return ad.getTime() - bd.getTime()
-        })
-      } else {
-        allUsers.sort((a, b) => {
-          const al = (a.card?.transactions ?? []).reduce((s, t) => s + Math.abs(t.amountCentavos), 0)
-          const bl = (b.card?.transactions ?? []).reduce((s, t) => s + Math.abs(t.amountCentavos), 0)
-          return bl - al
-        })
-      }
-      return res.json({ customers: allUsers.slice(skip, skip + limit).map(toCustomer), total, page, totalPages: Math.ceil(total / limit) })
-    }
-
-    const orderBy =
-      sort === 'visits'  ? { card: { totalVisits: 'desc' } }
-      : sort === 'balance' ? { card: { balanceCentavos: 'desc' } }
-      : { createdAt: 'desc' }
-
-    const [users, total] = await Promise.all([
-      prisma.user.findMany({ where, include: { card: { include: purchaseInclude } }, orderBy, skip, take: limit }),
-      prisma.user.count({ where }),
+    const [rows, countRows] = await Promise.all([
+      prisma.$queryRaw`
+        SELECT
+          pe.id::text                       AS id,
+          pe.display_name                   AS name,
+          pe.normalized_phone               AS phone,
+          pe.normalized_email               AS email,
+          pe.created_at                     AS "createdAt",
+          c.id::text                        AS "cardId",
+          c.card_number                     AS "cardNumber",
+          c.balance_cents                   AS "balanceCentavos",
+          c.total_visits                    AS "totalVisits",
+          c.visits_this_cycle               AS "visitsThisCycle",
+          c.pending_rewards                 AS "pendingRewards",
+          lv.last_visit                     AS "lastVisit",
+          COALESCE(ltv.ltv_centavos, 0)::bigint AS "ltvCentavos"
+        FROM core.people AS pe
+        LEFT JOIN loyalty.accounts AS a ON a.person_id = pe.id AND a.tenant_id = pe.tenant_id
+        LEFT JOIN loyalty.cards    AS c ON c.account_id = a.id
+        LEFT JOIN LATERAL (
+          SELECT max(occurred_at) AS last_visit
+          FROM loyalty.visit_events ve WHERE ve.loyalty_card_id = c.id
+        ) AS lv ON true
+        LEFT JOIN LATERAL (
+          SELECT COALESCE(sum(abs(amount_cents)), 0) AS ltv_centavos
+          FROM loyalty.wallet_transactions wt WHERE wt.loyalty_card_id = c.id AND wt.type = 'PURCHASE'
+        ) AS ltv ON true
+        WHERE pe.tenant_id = ${tenant.id}::uuid AND ${searchSql}
+        ORDER BY ${orderSql}
+        LIMIT ${limit} OFFSET ${skip}
+      `,
+      prisma.$queryRaw`
+        SELECT count(DISTINCT pe.id)::int AS n
+        FROM core.people AS pe
+        LEFT JOIN loyalty.accounts AS a ON a.person_id = pe.id AND a.tenant_id = pe.tenant_id
+        LEFT JOIN loyalty.cards    AS c ON c.account_id = a.id
+        WHERE pe.tenant_id = ${tenant.id}::uuid AND ${searchSql}
+      `,
     ])
 
-    return res.json({ customers: users.map(toCustomer), total, page, totalPages: Math.ceil(total / limit) })
+    const total = Number(countRows[0]?.n ?? 0)
+    const customers = rows.map(r => ({
+      id: r.id, name: r.name, phone: r.phone, email: r.email,
+      cardNumber:      r.cardNumber ?? '',
+      cardId:          r.cardId ?? '',
+      balanceMXN:      fmt(Number(r.balanceCentavos ?? 0)),
+      balanceCentavos: Number(r.balanceCentavos ?? 0),
+      totalVisits:     Number(r.totalVisits ?? 0),
+      visitsThisCycle: Number(r.visitsThisCycle ?? 0),
+      pendingRewards:  Number(r.pendingRewards ?? 0),
+      lastVisit:       r.lastVisit ? new Date(r.lastVisit).toISOString() : null,
+      createdAt:       r.createdAt ? new Date(r.createdAt).toISOString() : null,
+      ltvCentavos:     Number(r.ltvCentavos ?? 0),
+      ltvMXN:          fmt(Number(r.ltvCentavos ?? 0)),
+    }))
+
+    return res.json({ customers, total, page, totalPages: Math.max(1, Math.ceil(total / limit)) })
   } catch (err) {
     console.error('[customers]', err.message)
     return res.status(500).json({ error: err.message })
@@ -1918,11 +1990,22 @@ app.get('/api/:slug/admin/reward-config', async (req, res) => {
     if (!(await requireLegacyProduct(req, res, 'cash'))) return null
     const tenant = await getTenant(req.params.slug)
     if (!tenant) return notFound(res)
+    const select = Prisma.sql`
+      id::text, tenant_id::text AS "tenantId", program_id::text AS "programId",
+      visits_required AS "visitsRequired", reward_name AS "rewardName",
+      reward_description AS "rewardDescription", reward_cost_cents AS "rewardCostCentavos",
+      is_active AS "isActive", activated_at AS "activatedAt", created_at AS "createdAt"`
     const [active, history] = await Promise.all([
-      prisma.rewardConfig.findFirst({ where: { tenantId: tenant.id, isActive: true }, orderBy: { activatedAt: 'desc' } }),
-      prisma.rewardConfig.findMany({ where: { tenantId: tenant.id, isActive: false }, orderBy: { activatedAt: 'desc' }, take: 10 }),
+      prisma.$queryRaw`
+        SELECT ${select} FROM loyalty.reward_configs
+        WHERE tenant_id = ${tenant.id}::uuid AND is_active = true
+        ORDER BY activated_at DESC NULLS LAST LIMIT 1`,
+      prisma.$queryRaw`
+        SELECT ${select} FROM loyalty.reward_configs
+        WHERE tenant_id = ${tenant.id}::uuid AND is_active = false
+        ORDER BY activated_at DESC NULLS LAST LIMIT 10`,
     ])
-    return res.json({ active, history })
+    return res.json({ active: active[0] || null, history })
   } catch (err) {
     return res.status(500).json({ error: err.message })
   }
@@ -1935,13 +2018,23 @@ const handleRewardConfigUpdate = async (req, res) => {
     if (!tenant) return notFound(res)
     const { visitsRequired, rewardName, rewardDescription, rewardCostCentavos } = req.body
     if (!visitsRequired || !rewardName) return res.status(400).json({ error: 'visitsRequired and rewardName are required' })
-    const newConfig = await prisma.$transaction(async tx => {
-      await tx.rewardConfig.updateMany({ where: { tenantId: tenant.id, isActive: true }, data: { isActive: false } })
-      return tx.rewardConfig.create({
-        data: { tenantId: tenant.id, visitsRequired: parseInt(visitsRequired), rewardName, rewardDescription: rewardDescription ?? null, rewardCostCentavos: rewardCostCentavos ?? 0, isActive: true },
-      })
-    })
-    return res.json({ ok: true, newConfig })
+    const [, inserted] = await prisma.$transaction([
+      prisma.$executeRaw`
+        UPDATE loyalty.reward_configs SET is_active = false
+        WHERE tenant_id = ${tenant.id}::uuid AND is_active = true`,
+      prisma.$queryRaw`
+        INSERT INTO loyalty.reward_configs
+          (tenant_id, program_id, visits_required, reward_name, reward_description, reward_cost_cents, is_active, activated_at)
+        VALUES (
+          ${tenant.id}::uuid, ${tenant.programId}::uuid, ${parseInt(visitsRequired)},
+          ${rewardName}, ${rewardDescription ?? null}, ${rewardCostCentavos ?? 0}, true, now()
+        )
+        RETURNING id::text, tenant_id::text AS "tenantId", program_id::text AS "programId",
+                  visits_required AS "visitsRequired", reward_name AS "rewardName",
+                  reward_description AS "rewardDescription", reward_cost_cents AS "rewardCostCentavos",
+                  is_active AS "isActive", activated_at AS "activatedAt"`,
+    ])
+    return res.json({ ok: true, newConfig: inserted[0] })
   } catch (err) {
     return res.status(500).json({ error: err.message })
   }
@@ -1972,7 +2065,7 @@ app.get('/api/:slug/admin/staff', async (req, res) => {
           NULL::timestamptz AS "disabledAt",
           created_at AS "createdAt",
           updated_at AS "updatedAt"
-        FROM platform.staff_members
+        FROM core.staff_members
         WHERE tenant_id = ${ctx.tenantId}::uuid
         ORDER BY
           CASE WHEN lower(name) = 'admin' THEN 0 ELSE 1 END,
@@ -2006,7 +2099,7 @@ app.post('/api/:slug/admin/staff', async (req, res) => {
 
     {
       const rows = await prisma.$queryRaw`
-        INSERT INTO platform.staff_members (
+        INSERT INTO core.staff_members (
           tenant_id,
           location_id,
           name,
@@ -2061,7 +2154,7 @@ app.patch('/api/:slug/admin/staff/:staffId', async (req, res) => {
 
     {
       const rows = await prisma.$queryRaw`
-        UPDATE platform.staff_members
+        UPDATE core.staff_members
         SET
           name = CASE WHEN ${hasName} THEN ${String(req.body.name || '').trim()} ELSE name END,
           phone = CASE WHEN ${hasPhone} THEN NULLIF(${String(req.body.phone || '').trim()}, '') ELSE phone END,
@@ -2099,7 +2192,7 @@ app.delete('/api/:slug/admin/staff/:staffId', async (req, res) => {
 
     {
       const rows = await prisma.$queryRaw`
-        UPDATE platform.staff_members
+        UPDATE core.staff_members
         SET status = 'disabled', updated_at = now()
         WHERE id = ${req.params.staffId}::uuid
           AND tenant_id = ${ctx.tenantId}::uuid
@@ -2113,7 +2206,7 @@ app.delete('/api/:slug/admin/staff/:staffId', async (req, res) => {
   }
 })
 
-// ── business hours (linked to conversaflow.businesses) ────────────────────────
+// ── business hours (linked to ops.businesses) ────────────────────────
 
 const DAY_NUM_TO_ID   = { '0':'sun','1':'mon','2':'tue','3':'wed','4':'thu','5':'fri','6':'sat' }
 const DAY_ID_TO_NUM   = { sun:'0', mon:'1', tue:'2', wed:'3', thu:'4', fri:'5', sat:'6' }
@@ -2146,23 +2239,27 @@ app.get('/api/:slug/admin/hours', async (req, res) => {
   try {
     const ctx = await getDashboardContext(req.params.slug, req.query.locationId || null)
     if (!ctx) return notFound(res)
+    const dflt = Object.fromEntries(Object.values(DAY_NUM_TO_ID).map(id => [id, { open: true, from: '08:00', to: '20:00' }]))
     if (!ctx.businessId) {
-      const dflt = Object.fromEntries(Object.values(DAY_NUM_TO_ID).map(id => [id, { open: true, from: '08:00', to: '20:00' }]))
       return res.json({ hours: dflt, timezone: 'America/Mexico_City', businessId: null })
     }
     {
+      // ops.business_hours is normalized one row per day_of_week (0=Sun..6=Sat).
       const rows = await prisma.$queryRaw`
-        SELECT weekly_hours, timezone
-        FROM commerce.business_hours
+        SELECT day_of_week, opens_at::text AS opens_at, closes_at::text AS closes_at, is_closed
+        FROM ops.business_hours
         WHERE tenant_id = ${ctx.tenantId}::uuid
           AND location_id IS NOT DISTINCT FROM ${ctx.locationId}::uuid
-        ORDER BY created_at DESC
-        LIMIT 1
       `
-      const dflt = Object.fromEntries(Object.values(DAY_NUM_TO_ID).map(id => [id, { open: true, from: '08:00', to: '20:00' }]))
-      const weeklyHours = rows[0]?.weekly_hours
-      const hours = weeklyHours?.days ? openTimesToHours(weeklyHours) : (weeklyHours && Object.keys(weeklyHours).length ? weeklyHours : dflt)
-      return res.json({ hours, timezone: rows[0]?.timezone || ctx.tenant.timezone || 'America/Mexico_City', businessId: ctx.tenantId })
+      const hours = { ...dflt }
+      for (const r of rows) {
+        const id = DAY_NUM_TO_ID[String(r.day_of_week)]
+        if (!id) continue
+        hours[id] = r.is_closed
+          ? { open: false, from: '00:00', to: '00:00' }
+          : { open: true, from: (r.opens_at || '08:00').slice(0, 5), to: (r.closes_at || '20:00').slice(0, 5) }
+      }
+      return res.json({ hours, timezone: ctx.tenant.timezone || 'America/Mexico_City', businessId: ctx.tenantId })
     }
   } catch (err) {
     console.error('[hours GET]', err.message)
@@ -2175,30 +2272,30 @@ app.patch('/api/:slug/admin/hours', async (req, res) => {
     const ctx = await getDashboardContext(req.params.slug, req.query.locationId || null)
     if (!ctx) return notFound(res)
     if (!ctx.businessId) return businessNotLinked(res)
-    const { hours, timezone } = req.body
+    const { hours } = req.body
     if (!hours) return res.status(400).json({ error: 'hours required' })
     {
-      const updated = await prisma.$queryRaw`
-        UPDATE commerce.business_hours
-        SET
-          weekly_hours = ${JSON.stringify(hours)}::jsonb,
-          timezone = ${timezone || ctx.tenant.timezone || 'America/Mexico_City'},
-          updated_at = now()
-        WHERE tenant_id = ${ctx.tenantId}::uuid
-          AND location_id IS NOT DISTINCT FROM ${ctx.locationId}::uuid
-        RETURNING id::text
-      `
-      if (!updated[0]) {
-        await prisma.$executeRaw`
-          INSERT INTO commerce.business_hours (tenant_id, location_id, timezone, weekly_hours)
-          VALUES (
-            ${ctx.tenantId}::uuid,
-            ${ctx.locationId}::uuid,
-            ${timezone || ctx.tenant.timezone || 'America/Mexico_City'},
-            ${JSON.stringify(hours)}::jsonb
-          )
-        `
+      // Replace the per-day rows for this tenant/location atomically.
+      const dayRows = []
+      for (const [id, h] of Object.entries(hours)) {
+        const num = DAY_ID_TO_NUM[id]
+        if (num === undefined) continue
+        dayRows.push({
+          dow: parseInt(num, 10),
+          opens: h.open ? (h.from || '08:00') : '00:00',
+          closes: h.open ? (h.to || '20:00') : '00:00',
+          isClosed: !h.open,
+        })
       }
+      await prisma.$transaction([
+        prisma.$executeRaw`
+          DELETE FROM ops.business_hours
+          WHERE tenant_id = ${ctx.tenantId}::uuid
+            AND location_id IS NOT DISTINCT FROM ${ctx.locationId}::uuid`,
+        ...dayRows.map(d => prisma.$executeRaw`
+          INSERT INTO ops.business_hours (tenant_id, location_id, day_of_week, opens_at, closes_at, is_closed)
+          VALUES (${ctx.tenantId}::uuid, ${ctx.locationId}::uuid, ${d.dow}, ${d.opens}::time, ${d.closes}::time, ${d.isClosed})`),
+      ])
       return res.json({ ok: true })
     }
   } catch (err) {
@@ -2229,12 +2326,12 @@ app.get('/api/:slug/orders', async (req, res) => {
       const rows = await prisma.$queryRaw`
         SELECT
           t.id::text AS ticket_id,
-          t.status::text,
-          t.customer_name,
-          t.customer_phone,
+          t.kitchen_status::text AS status,
+          t.pickup_person AS customer_name,
+          NULL::text AS customer_phone,
           t.station_id::text,
-          s.name AS station_name,
-          t.customer_note,
+          t.station_name AS station_name,
+          t.notes AS customer_note,
           (t.total_cents::numeric / 100.0) AS total_amount,
           t.created_at,
           t.updated_at,
@@ -2254,15 +2351,13 @@ app.get('/api/:slug/orders', async (req, res) => {
             ) FILTER (WHERE i.id IS NOT NULL),
             '[]'::jsonb
           ) AS items
-        FROM kds.tickets AS t
-        LEFT JOIN kds.stations AS s
-          ON s.id = t.station_id
-        LEFT JOIN kds.ticket_items AS i
-          ON i.ticket_id = t.id
+        FROM ops.orders AS t
+        LEFT JOIN ops.order_items AS i
+          ON i.order_id = t.id
         WHERE t.tenant_id = ${ctx.tenantId}::uuid
           AND (${ctx.locationId}::uuid IS NULL OR t.location_id IS NOT DISTINCT FROM ${ctx.locationId}::uuid)
-          AND t.status::text IN (${Prisma.join(statuses)})
-        GROUP BY t.id, s.id
+          AND t.kitchen_status::text IN (${Prisma.join(statuses)})
+        GROUP BY t.id
         ORDER BY t.created_at DESC
         LIMIT 100
       `
@@ -2287,12 +2382,12 @@ app.post('/api/:slug/orders/:ticketId/transition', async (req, res) => {
 
     {
       const rows = await prisma.$queryRaw`
-        UPDATE kds.tickets
-        SET status = ${targetStatus}, updated_at = now()
+        UPDATE ops.orders
+        SET kitchen_status = , updated_at = now()
         WHERE id = ${req.params.ticketId}::uuid
           AND tenant_id = ${ctx.tenantId}::uuid
           AND (${ctx.locationId}::uuid IS NULL OR location_id IS NOT DISTINCT FROM ${ctx.locationId}::uuid)
-        RETURNING id::text AS ticket_id, status
+        RETURNING id::text AS ticket_id, kitchen_status AS status
       `
       if (!rows[0]) return res.status(404).json({ error: 'Ticket not found' })
       return res.json({ ok: true, ticket: rows[0] })
@@ -2319,25 +2414,27 @@ app.get('/api/:slug/admin/devices', async (req, res) => {
           ds.station_id::text,
           s.name AS station_name,
           ds.created_at,
-          ds.last_seen_at AS last_used_at,
+          ds.last_used_at AS last_used_at,
           ds.is_active,
           COALESCE(open_counts.open_count, 0)::int AS open
-        FROM kds.device_sessions AS ds
-        LEFT JOIN kds.stations AS s
+        FROM device.sessions AS ds
+        LEFT JOIN kitchen.stations AS s
           ON s.id = ds.station_id
         LEFT JOIN (
-          SELECT station_id, count(*) AS open_count
-          FROM kds.tickets
-          WHERE tenant_id = ${ctx.tenantId}::uuid
-            AND (${ctx.locationId}::uuid IS NULL OR location_id IS NOT DISTINCT FROM ${ctx.locationId}::uuid)
-            AND status IN ('new', 'accepted', 'preparing', 'ready')
-          GROUP BY station_id
+          SELECT ks.id AS station_id, count(*) AS open_count
+          FROM ops.orders AS o
+          JOIN kitchen.stations AS ks
+            ON ks.tenant_id = o.tenant_id
+           AND (ks.name = o.station_name OR ks.station_key = o.station_id)
+          WHERE o.tenant_id = ${ctx.tenantId}::uuid
+            AND (${ctx.locationId}::uuid IS NULL OR o.location_id IS NOT DISTINCT FROM ${ctx.locationId}::uuid)
+            AND o.kitchen_status IN ('new', 'accepted', 'preparing', 'ready')
+          GROUP BY ks.id
         ) AS open_counts
           ON open_counts.station_id IS NOT DISTINCT FROM ds.station_id
         WHERE ds.tenant_id = ${ctx.tenantId}::uuid
-          AND (${ctx.locationId}::uuid IS NULL OR ds.location_id IS NOT DISTINCT FROM ${ctx.locationId}::uuid)
           AND ds.is_active = true
-        ORDER BY ds.last_seen_at DESC NULLS LAST, ds.created_at DESC
+        ORDER BY ds.last_used_at DESC NULLS LAST, ds.created_at DESC
       `
       return res.json({ devices: rows })
     }
@@ -2355,7 +2452,7 @@ app.get('/api/:slug/admin/stations', async (req, res) => {
 
     const rows = await prisma.$queryRaw`
       SELECT id::text, station_key, name, status
-      FROM kds.stations
+      FROM kitchen.stations
       WHERE tenant_id = ${ctx.tenantId}::uuid
         AND (${ctx.locationId}::uuid IS NULL OR location_id IS NOT DISTINCT FROM ${ctx.locationId}::uuid)
         AND status = 'active'
@@ -2461,7 +2558,7 @@ app.post('/api/:slug/admin/devices/provision', async (req, res) => {
           SELECT encode(gen_random_bytes(32), 'hex') AS value
         ),
         inserted AS (
-          INSERT INTO kds.device_sessions (tenant_id, location_id, device_name, station_id, token_hash)
+          INSERT INTO device.sessions (tenant_id, location_id, device_name, station_id, token_hash)
           SELECT
             ${ctx.tenantId}::uuid,
             ${ctx.locationId}::uuid,
@@ -2493,7 +2590,7 @@ app.post('/api/:slug/admin/devices/:deviceId/revoke', async (req, res) => {
 
     {
       const rows = await prisma.$queryRaw`
-        UPDATE kds.device_sessions
+        UPDATE device.sessions
         SET
           is_active = false,
           revoked_at = COALESCE(revoked_at, now()),
@@ -2525,7 +2622,7 @@ app.patch('/api/:slug/admin/devices/:deviceId', async (req, res) => {
     const shouldRevoke = isActive === false
     {
       const rows = await prisma.$queryRaw`
-        UPDATE kds.device_sessions
+        UPDATE device.sessions
         SET
           is_active = COALESCE(${typeof isActive === 'boolean' ? isActive : null}, is_active),
           revoked_at = CASE
@@ -2574,22 +2671,20 @@ app.get('/api/:slug/admin/ticker', async (req, res) => {
     {
       const rows = await prisma.$queryRaw`
         SELECT
-          e.sequence::text,
-          e.kind::text,
-          e.status::text,
+          e.kitchen_sequence::text AS sequence,
+          e.event_kind::text AS kind,
+          e.new_status::text AS status,
           e.occurred_at,
           e.payload,
-          t.customer_name,
-          s.name AS station_name,
+          t.pickup_person AS customer_name,
+          t.station_name AS station_name,
           (t.total_cents::numeric / 100.0) AS total_amount
-        FROM kds.ticket_events AS e
-        LEFT JOIN kds.tickets AS t
-          ON t.id = e.ticket_id
-        LEFT JOIN kds.stations AS s
-          ON s.id = t.station_id
+        FROM ops.order_events AS e
+        LEFT JOIN ops.orders AS t
+          ON t.id = e.order_id
         WHERE e.tenant_id = ${ctx.tenantId}::uuid
           AND (${ctx.locationId}::uuid IS NULL OR t.location_id IS NOT DISTINCT FROM ${ctx.locationId}::uuid)
-        ORDER BY e.sequence DESC
+        ORDER BY e.kitchen_sequence DESC NULLS LAST
         LIMIT 20
       `
 
@@ -2618,34 +2713,39 @@ app.get('/api/:slug/admin/gift-cards', async (req, res) => {
     const tenant = await getTenant(req.params.slug)
     if (!tenant) return notFound(res)
     const { page, limit, skip } = parsePagination(req.query)
-    const [giftCards, total] = await Promise.all([
-      prisma.giftCard.findMany({
-        where: { tenantId: tenant.id },
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-      }),
-      prisma.giftCard.count({ where: { tenantId: tenant.id } }),
+    const [giftCards, countRows] = await Promise.all([
+      prisma.$queryRaw`
+        SELECT id::text, code, amount_cents AS "amountCentavos", sender_name AS "senderName",
+               recipient_name AS "recipientName", recipient_email AS "recipientEmail",
+               recipient_phone AS "recipientPhone", message,
+               (redeemed_at IS NOT NULL) AS "isRedeemed",
+               redeemed_at AS "redeemedAt", expires_at AS "expiresAt", created_at AS "createdAt"
+        FROM loyalty.gift_cards
+        WHERE tenant_id = ${tenant.id}::uuid
+        ORDER BY created_at DESC
+        LIMIT ${limit} OFFSET ${skip}`,
+      prisma.$queryRaw`SELECT count(*)::int AS n FROM loyalty.gift_cards WHERE tenant_id = ${tenant.id}::uuid`,
     ])
+    const total = Number(countRows[0]?.n ?? 0)
     return res.json({
       giftCards: giftCards.map(g => ({
         id: g.id,
         code: g.code,
-        amountCentavos: g.amountCentavos,
-        amountMXN: fmt(g.amountCentavos),
+        amountCentavos: Number(g.amountCentavos ?? 0),
+        amountMXN: fmt(Number(g.amountCentavos ?? 0)),
         senderName: g.senderName,
         recipientName: g.recipientName,
         recipientEmail: g.recipientEmail,
         recipientPhone: g.recipientPhone,
         message: g.message,
         isRedeemed: g.isRedeemed,
-        redeemedAt: g.redeemedAt?.toISOString() ?? null,
-        expiresAt: g.expiresAt?.toISOString() ?? null,
-        createdAt: g.createdAt.toISOString(),
+        redeemedAt: g.redeemedAt ? new Date(g.redeemedAt).toISOString() : null,
+        expiresAt: g.expiresAt ? new Date(g.expiresAt).toISOString() : null,
+        createdAt: g.createdAt ? new Date(g.createdAt).toISOString() : null,
       })),
       total,
       page,
-      totalPages: Math.ceil(total / limit),
+      totalPages: Math.max(1, Math.ceil(total / limit)),
     })
   } catch (err) {
     console.error('[gift-cards GET]', err.message)
@@ -2674,10 +2774,10 @@ app.get('/api/:slug/admin/conversations', async (req, res) => {
           co.phone AS "customerPhone",
           count(m.id)::int AS "messageCount",
           max(coalesce(m.created_at, m.received_at)) AS "lastMessageAt"
-        FROM conversaflow.conversations AS c
-        LEFT JOIN platform.people AS co
+        FROM comms.conversations AS c
+        LEFT JOIN core.people AS co
           ON co.id = c.person_id
-        LEFT JOIN conversaflow.messages AS m
+        LEFT JOIN comms.messages AS m
           ON m.conversation_id = c.id
         WHERE c.tenant_id = ${ctx.tenantId}::uuid
         GROUP BY c.id, co.id
@@ -2687,7 +2787,7 @@ app.get('/api/:slug/admin/conversations', async (req, res) => {
       `
       const countRows = await prisma.$queryRaw`
         SELECT count(*)::int AS total
-        FROM conversaflow.conversations
+        FROM comms.conversations
         WHERE tenant_id = ${ctx.tenantId}::uuid
       `
       return res.json({
